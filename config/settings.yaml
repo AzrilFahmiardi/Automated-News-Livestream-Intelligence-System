@@ -1,0 +1,77 @@
+# Channels Configuration
+channels:
+  - name: "KompasTV"
+    url: "https://www.youtube.com/watch?v=DOOrIxw5xOw"  
+    enabled: true
+    resolution: "1080p"
+    
+# Browser Automation Settings
+browser:
+  headless: false  
+  user_data_dir: "./browser_data"
+  stealth_mode: true
+  random_mouse_interval: 30  # seconds
+  tab_switch_interval: 120   # seconds
+
+# Frame Sampling (Video Processing)
+video:
+  fps_sample_rate: 0.5  
+  ribbon_roi:
+    # Region of Interest for lower-third/ribbon
+    x: 0
+    y: 0.8  
+    width: 1.0
+    height: 0.2
+  frame_diff_threshold: 30  
+
+# Audio Processing
+audio:
+  chunk_duration: 30  # seconds per audio chunk
+  sample_rate: 16000
+  whisper_model: "base"  
+  language: "id"  
+
+# OCR Settings
+ocr:
+  engine: "tesseract"  # tesseract or paddleocr
+  languages: ["ind", "eng"]  
+  confidence_threshold: 0.7
+  preprocessing:
+    denoise: true
+    contrast_enhance: true
+
+# LLM Reasoning
+llm:
+  model_path: "./models/qwen2.5-1.5b-instruct-q4_k_m.gguf"
+  context_size: 4096
+  temperature: 0.3
+  max_tokens: 1024
+  n_gpu_layers: 0  # CPU-only
+  n_threads: 4
+
+# Segment Detection
+segment:
+  min_duration: 30  
+  max_duration: 600 
+  idle_threshold: 10  
+
+# Output Settings
+output:
+  format: "json"
+  directory: "./output/segments"
+  naming_pattern: "{channel}_{timestamp}_{segment_id}.json"
+  pretty_print: true
+
+# Logging
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  file: "./output/logs/system.log"
+  rotation: "1 day"
+  retention: "7 days"
+
+# System Resources
+system:
+  max_memory_mb: 4096
+  storage_limit_gb: 18
+  cleanup_old_segments: true
+  segment_retention_days: 7
