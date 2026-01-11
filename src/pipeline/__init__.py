@@ -12,7 +12,7 @@ from typing import Dict, Optional
 import time
 
 from ..browser import StreamCapturer
-from ..video import OCRProcessor
+from ..vision import MoondreamProcessor  
 from ..audio import WhisperProcessor
 from ..llm import LlamaReasoning
 from ..segment import SegmentDetector
@@ -30,7 +30,7 @@ class NewsOrchestrator:
         logger.info("Initializing pipeline components...")
 
         self.browser = StreamCapturer(config)
-        self.ocr = OCRProcessor(config)
+        self.vision = MoondreamProcessor(config)  
         self.whisper = WhisperProcessor(config)
         self.llm = LlamaReasoning(config)
         self.detector = SegmentDetector(config)
@@ -112,7 +112,7 @@ class NewsOrchestrator:
         while self.is_running:
             current_time = time.time()
 
-            # Process video frame (OCR)
+            # Process video frame
             if current_time - last_frame_time >= frame_interval:
                 await self._process_frame(previous_ribbon_text)
                 last_frame_time = current_time
@@ -137,21 +137,39 @@ class NewsOrchestrator:
             await asyncio.sleep(0.1)
 
     async def _process_frame(self, previous_ribbon_text: Optional[str]):
-        """Process single video frame"""
+        """Process single video frame with Moondream VLM"""
         try:
             # Capture frame
             frame_data = await self.browser.capture_frame()
             if not frame_data:
                 return
 
-            # OCR processing
-            ribbon_result = self.ocr.process_frame(frame_data)
+            # Moondream VLM processing 
+            vision_result = self.vision.process_frame(frame_data)
+
+            # Extract ribbon info for compatibility with segment detector
+            if vision_result:
+                ribbon_info = vision_result.get("ribbon_info", {})
+                # Convert to format expected by segment detector
+                ribbon_result = {
+                    "text": ribbon_info.get("text", ""),
+                    "confidence": ribbon_info.get("confidence", 0.0),
+                    "timestamp": vision_result.get("timestamp"),
+                    "person_name": ribbon_info.get("person_name", ""),
+                    "person_role": ribbon_info.get("person_role", ""),
+                    "scene_type": vision_result.get("scene_analysis", {}).get("scene_type", ""),
+                }
+            else:
+                ribbon_result = None
 
             # Add to segment
             should_continue = self.detector.add_ribbon_detection(ribbon_result)
 
-            if ribbon_result:
-                logger.debug(f"Ribbon detected: {ribbon_result.get('text', '')[:50]}")
+            if ribbon_result and ribbon_result.get("text"):
+                logger.debug(
+                    f"Vision: {ribbon_result.get('text', '')[:50]} "
+                    f"| Scene: {ribbon_result.get('scene_type', 'unknown')}"
+                )
 
         except Exception as e:
             logger.error(f"Frame processing error: {e}")

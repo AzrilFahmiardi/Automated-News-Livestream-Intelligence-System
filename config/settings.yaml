@@ -13,16 +13,48 @@ browser:
   random_mouse_interval: 30  # seconds
   tab_switch_interval: 120   # seconds
 
-# Frame Sampling (Video Processing)
+# Frame Sampling Configuration
 video:
-  fps_sample_rate: 0.5  
+  fps_sample_rate: 0.5
+  frame_diff_threshold: 30
+
+# Vision Understanding with Moondream VLM
+vision:
+  model_id: "vikhyatk/moondream2"
+  revision: "2025-06-21"
+  device: "cpu"
+  trust_remote_code: true
+  confidence_threshold: 0.7
+  # Moondream is SLOW on CPU (~4-5 min per frame)
+  # Only process 1 frame every N seconds to avoid blocking
+  sample_interval: 60  # Process 1 frame every 60 seconds (1 per minute)
+
+# OCR Processing with Tesseract
+ocr:
+  enabled: true
+  language: "ind+eng"  # Indonesian + English
+  confidence_threshold: 0.5
+  preprocessing: true
+  contrast_factor: 2.0
+  # Ribbon region (lower-third banner)
+  # Coordinates adjusted for actual frame size (1455x818)
   ribbon_roi:
-    # Region of Interest for lower-third/ribbon
-    x: 0
-    y: 0.8  
-    width: 1.0
-    height: 0.2
-  frame_diff_threshold: 30  
+    x1: 0
+    y1: 600
+    x2: 1455
+    y2: 818
+
+# YOLO Ribbon Detection + OCR
+yolo_ribbon:
+  model_path: "./models/yolov8n_finetuned.pt"
+  conf_threshold: 0.3
+  iou_threshold: 0.4
+  stability_frames: 2
+  animation_delay_frames: 3
+  text_similarity_threshold: 0.85
+  position_change_threshold: 0.15
+  no_detection_frames: 3
+  ocr_languages: ["id", "en"]
 
 # Audio Processing
 audio:
@@ -30,15 +62,6 @@ audio:
   sample_rate: 16000
   whisper_model: "base"  
   language: "id"  
-
-# OCR Settings
-ocr:
-  engine: "tesseract"  # tesseract or paddleocr
-  languages: ["ind", "eng"]  
-  confidence_threshold: 0.7
-  preprocessing:
-    denoise: true
-    contrast_enhance: true
 
 # LLM Reasoning
 llm:
@@ -61,6 +84,14 @@ output:
   directory: "./output/segments"
   naming_pattern: "{channel}_{timestamp}_{segment_id}.json"
   pretty_print: true
+
+# Debug Mode Settings
+debug:
+  output_dir: "./output/debug"
+  save_frames: true  # Save captured frames as PNG
+  save_audio: true   # Save audio chunks as WAV
+  save_vision: true  # Save Moondream results as JSON
+  monitor_interval: 5  # Console update interval (seconds)
 
 # Logging
 logging:

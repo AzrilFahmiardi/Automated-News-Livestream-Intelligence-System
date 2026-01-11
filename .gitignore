@@ -48,10 +48,7 @@ models/*.pt
 !models/.gitkeep
 
 # Output
-output/segments/*.json
-output/logs/*.log
-!output/segments/.gitkeep
-!output/logs/.gitkeep
+output/
 
 # Browser automation
 .playwright/

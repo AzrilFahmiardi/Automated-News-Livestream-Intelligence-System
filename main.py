@@ -5,6 +5,7 @@ Main entry point
 
 Usage:
     python main.py [--config CONFIG_PATH] [--channel CHANNEL_NAME]
+    python main.py --debug [--config CONFIG_PATH] [--channel CHANNEL_NAME]
 """
 
 import argparse
@@ -18,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from src.utils import load_config, setup_logging, get_enabled_channels
 from src.pipeline import NewsOrchestrator
+from src.pipeline.debug_mode import DebugOrchestrator
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +40,11 @@ async def main():
     parser.add_argument(
         "--channel", type=str, default=None, help="Specific channel name to process"
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Run in DEBUG mode (disable segmentation, enable monitoring)",
+    )
 
     args = parser.parse_args()
 
@@ -45,13 +52,17 @@ async def main():
     try:
         config = load_config(args.config)
     except Exception as e:
-        print(f"❌ Failed to load config: {e}")
+        print(f"ERROR: Failed to load config: {e}")
         sys.exit(1)
 
     # Setup logging
     setup_logging(config)
     logger.info("=" * 60)
     logger.info("Automated News Livestream Intelligence System")
+    if args.debug:
+        logger.info("MODE: DEBUG (Segmentation Disabled)")
+    else:
+        logger.info("MODE: PRODUCTION (Auto-segmentation Enabled)")
     logger.info("=" * 60)
 
     # Get channels to process
@@ -73,9 +84,16 @@ async def main():
     channel = enabled_channels[0]
     logger.info(f"Processing channel: {channel.get('name')}")
 
-    # Create orchestrator
+    # Create orchestrator based on mode
     try:
-        orchestrator = NewsOrchestrator(config)
+        if args.debug:
+            # Debug mode - no segmentation, continuous capture
+            logger.info("Initializing DEBUG mode orchestrator...")
+            orchestrator = DebugOrchestrator(config)
+        else:
+            # Production mode - with auto-segmentation
+            logger.info("Initializing PRODUCTION mode orchestrator...")
+            orchestrator = NewsOrchestrator(config)
     except Exception as e:
         logger.error(f"Failed to initialize orchestrator: {e}")
         sys.exit(1)
@@ -85,7 +103,8 @@ async def main():
         await orchestrator.start(channel)
     except KeyboardInterrupt:
         logger.info("\nShutdown requested by user")
-        await orchestrator.stop()
+        if hasattr(orchestrator, 'stop'):
+            await orchestrator.stop()
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
         sys.exit(1)
@@ -99,5 +118,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nInterrupted by user")
     except Exception as e:
-        print(f"❌ Fatal error: {e}")
+        print(f" Fatal error: {e}")
         sys.exit(1)

@@ -151,7 +151,7 @@ class StreamCapturer:
             await asyncio.sleep(2)
 
             # Set video quality
-            await self._set_video_quality("1080p")
+            # await self._set_video_quality("1080p")
 
             logger.info("Livestream opened successfully")
             self.is_running = True
@@ -232,6 +232,8 @@ class StreamCapturer:
         """
         Keep browser session alive with human-like activity
         Prevents bot detection and session timeout
+        
+        NOTE: Scroll disabled to prevent video jitter during ribbon detection
         """
         import random
         
@@ -247,9 +249,9 @@ class StreamCapturer:
                 y = random.randint(200, 900)
                 await self.page.mouse.move(x, y)
 
-                # Random small scroll (simulates user watching)
-                scroll_amount = random.randint(-20, 20)
-                await self.page.evaluate(f"window.scrollBy(0, {scroll_amount})")
+                # DISABLED: Random small scroll - causes video jitter for ribbon detection
+                # scroll_amount = random.randint(-20, 20)
+                # await self.page.evaluate(f"window.scrollBy(0, {scroll_amount})")
                 
                 # Occasionally move mouse over video (looks more human)
                 if random.random() < 0.3:  # 30% chance
