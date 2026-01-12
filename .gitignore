@@ -50,6 +50,9 @@ models/*.pt
 # Output
 output/
 
+# YOLO auto-generated folders
+runs/
+
 # Browser automation
 .playwright/
 browser_data/

@@ -12,10 +12,11 @@ from typing import Dict, Optional
 import time
 
 from ..browser import StreamCapturer
-from ..vision import MoondreamProcessor  
+from ..vision import YOLORibbonProcessor
 from ..audio import WhisperProcessor
 from ..llm import LlamaReasoning
 from ..segment import SegmentDetector
+from ..utils import now_wib
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +31,7 @@ class NewsOrchestrator:
         logger.info("Initializing pipeline components...")
 
         self.browser = StreamCapturer(config)
-        self.vision = MoondreamProcessor(config)  
+        self.vision = YOLORibbonProcessor(config)
         self.whisper = WhisperProcessor(config)
         self.llm = LlamaReasoning(config)
         self.detector = SegmentDetector(config)
@@ -137,39 +138,35 @@ class NewsOrchestrator:
             await asyncio.sleep(0.1)
 
     async def _process_frame(self, previous_ribbon_text: Optional[str]):
-        """Process single video frame with Moondream VLM"""
+        """Process single video frame with YOLO ribbon detection"""
         try:
             # Capture frame
             frame_data = await self.browser.capture_frame()
             if not frame_data:
                 return
 
-            # Moondream VLM processing 
+            # YOLO + OCR ribbon processing
             vision_result = self.vision.process_frame(frame_data)
 
-            # Extract ribbon info for compatibility with segment detector
+            # Check if ribbon detected and changed
             if vision_result:
-                ribbon_info = vision_result.get("ribbon_info", {})
-                # Convert to format expected by segment detector
+                # Format dari YOLO
                 ribbon_result = {
-                    "text": ribbon_info.get("text", ""),
-                    "confidence": ribbon_info.get("confidence", 0.0),
-                    "timestamp": vision_result.get("timestamp"),
-                    "person_name": ribbon_info.get("person_name", ""),
-                    "person_role": ribbon_info.get("person_role", ""),
-                    "scene_type": vision_result.get("scene_analysis", {}).get("scene_type", ""),
+                    "text": vision_result.get("text", ""),
+                    "confidence": vision_result.get("confidence", 0.0),
+                    "timestamp": datetime.now().isoformat(),
                 }
+                
+                # Add to segment detector
+                should_continue = self.detector.add_ribbon_detection(ribbon_result)
+                
+                # Log detection
+                change_type = vision_result.get("change_type", "unknown")
+                text = vision_result.get("text", "")
+                logger.info(f"Ribbon {change_type}: {text[:60]}")
             else:
-                ribbon_result = None
-
-            # Add to segment
-            should_continue = self.detector.add_ribbon_detection(ribbon_result)
-
-            if ribbon_result and ribbon_result.get("text"):
-                logger.debug(
-                    f"Vision: {ribbon_result.get('text', '')[:50]} "
-                    f"| Scene: {ribbon_result.get('scene_type', 'unknown')}"
-                )
+                # No change detected, add None to track ribbon absence
+                self.detector.add_ribbon_detection(None)
 
         except Exception as e:
             logger.error(f"Frame processing error: {e}")
@@ -200,6 +197,12 @@ class NewsOrchestrator:
             # End segment
             segment_data = self.detector.end_segment()
             if not segment_data:
+                return
+
+            # Skip segment if no ribbons detected (idle timeout)
+            if not segment_data.get("ribbon_texts") or len(segment_data["ribbon_texts"]) == 0:
+                logger.info(f"Skipping segment {segment_data['segment_id']} - no ribbons detected")
+                self.detector.start_segment(channel)
                 return
 
             logger.info(f"Finalizing segment: {segment_data['segment_id']}")
@@ -245,6 +248,22 @@ class NewsOrchestrator:
         Returns:
             dict: Final output structure
         """
+        # Build content section 
+        content = {}
+        
+        # Title - required
+        content["title"] = content_data.get("title", "")
+        
+        # Actors - optional (only if detected)
+        if "actors" in content_data and len(content_data["actors"]) > 0:
+            content["actors"] = content_data["actors"]
+        
+        # Summary - required
+        content["summary"] = content_data.get("summary", {"short": "", "full": ""})
+        
+        # Topics - required
+        content["topics"] = content_data.get("topics", [])
+        
         return {
             "segment": {
                 "channel": segment_data["channel"],
@@ -253,11 +272,7 @@ class NewsOrchestrator:
                 "end_time": segment_data["end_time"].isoformat(),
                 "duration_sec": segment_data["duration_sec"],
             },
-            "content": {
-                "actors": content_data.get("actors", []),
-                "summary": content_data.get("summary", {"short": "", "full": ""}),
-                "topics": content_data.get("topics", []),
-            },
+            "content": content,
             "raw": {
                 "speech_text": " ".join(
                     [chunk.get("text", "") for chunk in segment_data.get("audio_chunks", [])]

@@ -29,9 +29,6 @@ sudo apt-get install -y \
     python3.10 \
     python3.10-dev \
     python3-pip \
-    tesseract-ocr \
-    tesseract-ocr-ind \
-    tesseract-ocr-eng \
     ffmpeg \
     libopencv-dev \
     cmake \
@@ -61,13 +58,6 @@ python -m patchright install chromium
 # Verify installations
 echo -e "${YELLOW}Verifying installations...${NC}"
 
-# Check Tesseract
-if command -v tesseract &> /dev/null; then
-    echo -e "${GREEN}Tesseract OCR installed: $(tesseract --version | head -n 1)${NC}"
-else
-    echo -e "${RED}Tesseract OCR not found${NC}"
-fi
-
 # Check FFmpeg
 if command -v ffmpeg &> /dev/null; then
     echo -e "${GREEN}FFmpeg installed: $(ffmpeg -version | head -n 1 | cut -d' ' -f3)${NC}"
@@ -76,9 +66,12 @@ else
 fi
 
 # Check Python packages
-python -c "import patchright; print('patchright installed')" 2>/dev/null || echo -e "${RED}patchright not found${NC}"
-python -c "import cv2; print('opencv-python installed')" 2>/dev/null || echo -e "${RED}opencv-python not found${NC}"
-python -c "import pytesseract; print('pytesseract installed')" 2>/dev/null || echo -e "${RED}pytesseract not found${NC}"
+python -c "import patchright; print('✓ patchright installed')" 2>/dev/null || echo -e "${RED}✗ patchright not found${NC}"
+python -c "import cv2; print('✓ opencv-python installed')" 2>/dev/null || echo -e "${RED}✗ opencv-python not found${NC}"
+python -c "import easyocr; print('✓ easyocr installed')" 2>/dev/null || echo -e "${RED}✗ easyocr not found${NC}"
+python -c "import ultralytics; print('✓ ultralytics (YOLO) installed')" 2>/dev/null || echo -e "${RED}✗ ultralytics not found${NC}"
+python -c "import pywhispercpp; print('✓ pywhispercpp installed')" 2>/dev/null || echo -e "${RED}✗ pywhispercpp not found${NC}"
+python -c "import llama_cpp; print('✓ llama-cpp-python installed')" 2>/dev/null || echo -e "${RED}✗ llama-cpp-python not found${NC}"
 
 echo ""
 echo -e "${GREEN}Setup complete!${NC}"

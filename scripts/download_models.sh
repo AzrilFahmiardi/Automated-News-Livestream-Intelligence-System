@@ -40,6 +40,14 @@ download_model() {
     fi
 }
 
+# Download YOLO fine-tuned model
+echo ""
+echo "=== YOLO Ribbon Detection Model ==="
+download_model \
+    "https://huggingface.co/AzrilFahmiardi/yt-news-ribbon-yolov8n-detector/resolve/main/yolov8n_finetuned.pt" \
+    "$MODELS_DIR/yolov8n_finetuned.pt" \
+    "YOLOv8n Fine-tuned (6MB)"
+
 # Download Whisper model (base)
 echo ""
 echo "=== Whisper Model ==="

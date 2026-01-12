@@ -18,32 +18,6 @@ video:
   fps_sample_rate: 0.5
   frame_diff_threshold: 30
 
-# Vision Understanding with Moondream VLM
-vision:
-  model_id: "vikhyatk/moondream2"
-  revision: "2025-06-21"
-  device: "cpu"
-  trust_remote_code: true
-  confidence_threshold: 0.7
-  # Moondream is SLOW on CPU (~4-5 min per frame)
-  # Only process 1 frame every N seconds to avoid blocking
-  sample_interval: 60  # Process 1 frame every 60 seconds (1 per minute)
-
-# OCR Processing with Tesseract
-ocr:
-  enabled: true
-  language: "ind+eng"  # Indonesian + English
-  confidence_threshold: 0.5
-  preprocessing: true
-  contrast_factor: 2.0
-  # Ribbon region (lower-third banner)
-  # Coordinates adjusted for actual frame size (1455x818)
-  ribbon_roi:
-    x1: 0
-    y1: 600
-    x2: 1455
-    y2: 818
-
 # YOLO Ribbon Detection + OCR
 yolo_ribbon:
   model_path: "./models/yolov8n_finetuned.pt"
@@ -76,7 +50,7 @@ llm:
 segment:
   min_duration: 30  
   max_duration: 600 
-  idle_threshold: 10  
+  idle_threshold: 60 
 
 # Output Settings
 output:
@@ -88,9 +62,9 @@ output:
 # Debug Mode Settings
 debug:
   output_dir: "./output/debug"
-  save_frames: true  # Save captured frames as PNG
+  save_frames: false  # only save frames with ribbon detection in ocr folder
   save_audio: true   # Save audio chunks as WAV
-  save_vision: true  # Save Moondream results as JSON
+  save_vision: true  # Save YOLO ribbon detection results as JSON
   monitor_interval: 5  # Console update interval (seconds)
 
 # Logging

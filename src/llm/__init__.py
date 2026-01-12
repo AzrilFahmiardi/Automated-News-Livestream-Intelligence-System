@@ -120,13 +120,14 @@ class LlamaReasoning:
         system_prompt = """Anda adalah AI assistant yang bertugas menganalisis berita TV Indonesia dan mengekstrak informasi terstruktur.
 
 Tugas Anda:
-1. Identifikasi SEMUA aktor/tokoh yang disebutkan (nama orang, organisasi, dll)
-2. Tentukan peran/jabatan masing-masing aktor
+1. Ekstrak judul berita dari teks ribbon PERTAMA (WAJIB)
+2. Identifikasi aktor/tokoh dari ribbon berikutnya atau speech (jika ada)
 3. Buat ringkasan berita (pendek dan lengkap)
 4. Tentukan topik/kategori berita
 
-Output HARUS dalam format JSON yang valid dengan struktur berikut:
+Output HARUS dalam format JSON yang valid:
 {
+  "title": "Judul berita dari ribbon pertama (WAJIB)",
   "actors": [
     {
       "name": "Nama lengkap aktor",
@@ -141,6 +142,13 @@ Output HARUS dalam format JSON yang valid dengan struktur berikut:
   },
   "topics": ["topik1", "topik2"]
 }
+
+PENTING:
+- Field "title": WAJIB diisi dari ribbon pertama (biasanya huruf besar, pernyataan singkat)
+- Field "actors": Hanya isi jika ada aktor yang terdeteksi (nama orang/organisasi dengan/tanpa jabatan)
+- Ribbon pertama = judul berita
+- Ribbon berikutnya (jika ada) = bisa berisi aktor atau info tambahan
+- Jangan paksa ada aktor jika memang tidak disebutkan
 
 Gunakan Bahasa Indonesia yang formal dan akurat."""
 
@@ -169,13 +177,26 @@ Ekstrak informasi terstruktur dalam format JSON."""
 
             data = json.loads(json_text)
 
-            # Validate structure
-            if not isinstance(data.get("actors"), list):
-                data["actors"] = []
-
+            # Validate and clean structure
+            
+            # Title - required
+            if "title" not in data or not data["title"]:
+                # Extract from first ribbon if available
+                if ribbon_texts and len(ribbon_texts) > 0:
+                    data["title"] = ribbon_texts[0].get("text", "")
+                else:
+                    data["title"] = ""
+            
+            # Actors - optional, remove if empty
+            if "actors" in data:
+                if not isinstance(data["actors"], list) or len(data["actors"]) == 0:
+                    del data["actors"]
+            
+            # Summary - required
             if not isinstance(data.get("summary"), dict):
                 data["summary"] = {"short": "", "full": ""}
 
+            # Topics - required
             if not isinstance(data.get("topics"), list):
                 data["topics"] = []
 
@@ -185,9 +206,13 @@ Ekstrak informasi terstruktur dalam format JSON."""
             logger.error(f"Failed to parse JSON response: {e}")
             logger.debug(f"Response was: {response}")
 
-            # Return minimal structure
+            # Return minimal structure with title from first ribbon
+            title = ""
+            if ribbon_texts and len(ribbon_texts) > 0:
+                title = ribbon_texts[0].get("text", "")
+            
             return {
-                "actors": [],
+                "title": title,
                 "summary": {"short": "", "full": speech_text[:200]},
                 "topics": [],
                 "raw_llm_response": response,

@@ -54,7 +54,7 @@ class YOLORibbonProcessor:
         self.no_detection_frames = yolo_config.get("no_detection_frames", 3)
         self.stability_frames = yolo_config.get("stability_frames", 2)
         self.text_similarity_threshold = yolo_config.get("text_similarity_threshold", 0.85)
-        self.animation_delay_frames = yolo_config.get("animation_delay_frames", 3)  # Wait for text animation
+        self.animation_delay_frames = yolo_config.get("animation_delay_frames", 3)  
         
         # OCR parameters
         self.ocr_languages = yolo_config.get("ocr_languages", ['id', 'en'])
@@ -67,7 +67,7 @@ class YOLORibbonProcessor:
         self.ribbon_present = False
         self.stable_bbox_count = 0
         self.pending_bbox = None
-        self.animation_wait_count = 0  # Counter for animation delay
+        self.animation_wait_count = 0  
         
         # Initialize models
         logger.info("Loading YOLO ribbon detection model...")
@@ -84,6 +84,9 @@ class YOLORibbonProcessor:
             raise FileNotFoundError(f"YOLO model not found: {self.model_path}")
         
         try:
+            import os
+            os.environ['YOLO_VERBOSE'] = 'False'
+            
             self.yolo_model = YOLO(str(self.model_path))
             logger.info(f"YOLO model loaded: {self.model_path.name}")
             logger.info(f"Confidence threshold: {self.conf_threshold}")
@@ -159,15 +162,16 @@ class YOLORibbonProcessor:
                     is_position_changed = True
             
             # Position changed significantly OR first detection
-            # Wait for animation to complete before extracting text
             if is_new_ribbon or is_position_changed:
                 self.animation_wait_count += 1
                 
                 if self.animation_wait_count < self.animation_delay_frames:
-                    logger.debug(f"Waiting for animation ({self.animation_wait_count}/{self.animation_delay_frames})")
+                    if self.animation_wait_count == 1:
+                        event_type = "New ribbon" if is_new_ribbon else "Ribbon position changed"
+                        logger.info(f"{event_type} - waiting for text animation to complete")
                     return None
             
-            # Animation delay complete, now extract text
+            # Extract text
             ribbon_crop = frame[bbox[1]:bbox[3], bbox[0]:bbox[2]]
             text = self._extract_text(ribbon_crop)
             
@@ -194,7 +198,7 @@ class YOLORibbonProcessor:
             self.frames_without_detection = 0
             self.stable_bbox_count = 0
             self.pending_bbox = None
-            self.animation_wait_count = 0  # Reset animation delay counter
+            self.animation_wait_count = 0  
             
             annotated_frame = self._annotate_frame(frame.copy(), bbox, text)
             
@@ -272,7 +276,7 @@ class YOLORibbonProcessor:
             # Significant position/size change
             return "position"
         
-        # Position similar, will check text later
+        # Position similar
         return "position"
 
     def _calculate_iou(self, bbox1: Tuple[int, int, int, int], bbox2: Tuple[int, int, int, int]) -> float:
@@ -443,7 +447,7 @@ class YOLORibbonProcessor:
             self.last_bbox = None
             self.last_text = None
             self.last_text_hash = None
-            self.animation_wait_count = 0  # Reset animation delay counter
+            self.animation_wait_count = 0  
             
             return {
                 "text": "",

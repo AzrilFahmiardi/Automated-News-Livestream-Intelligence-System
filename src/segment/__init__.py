@@ -7,6 +7,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 from collections import deque
+from ..utils import now_wib
 
 logger = logging.getLogger(__name__)
 
@@ -24,8 +25,10 @@ class SegmentDetector:
 
         # State tracking
         self.current_segment = None
-        self.ribbon_history = deque(maxlen=10)  # Last 10 ribbon detections
+        self.ribbon_history = deque(maxlen=10)  
         self.last_change_time = None
+        self.ribbon_disappeared = False  
+        self.frames_without_ribbon = 0  
 
         logger.info("Segment Detector initialized")
 
@@ -44,15 +47,17 @@ class SegmentDetector:
         self.current_segment = {
             "segment_id": segment_id,
             "channel": channel,
-            "start_time": datetime.now(),
+            "start_time": now_wib(),
             "end_time": None,
             "ribbon_texts": [],
             "audio_chunks": [],
             "status": "active",
         }
 
-        self.last_change_time = datetime.now()
+        self.last_change_time = now_wib()
         self.ribbon_history.clear()
+        self.ribbon_disappeared = False
+        self.frames_without_ribbon = 0
 
         logger.info(f"Started new segment: {segment_id}")
         return self.current_segment
@@ -62,7 +67,7 @@ class SegmentDetector:
         Add ribbon OCR detection to current segment
 
         Args:
-            ribbon_data: OCR result dict
+            ribbon_data: OCR result dict or None if no ribbon detected
 
         Returns:
             bool: True if segment should continue, False if should end
@@ -70,11 +75,24 @@ class SegmentDetector:
         if not self.current_segment:
             return False
 
-        # Add to segment
+        # Track ribbon presence/absence
         if ribbon_data and ribbon_data.get("text"):
+            # Ribbon detected
             self.current_segment["ribbon_texts"].append(ribbon_data)
             self.ribbon_history.append(ribbon_data["text"])
-            self.last_change_time = datetime.now()
+            self.last_change_time = now_wib()
+            self.frames_without_ribbon = 0
+            self.ribbon_disappeared = False
+        else:
+            # No ribbon detected
+            self.frames_without_ribbon += 1
+            
+            # Consider ribbon disappeared after 3 consecutive frames without detection
+            if self.frames_without_ribbon >= 3 and len(self.current_segment["ribbon_texts"]) > 0:
+                if not self.ribbon_disappeared:
+                    logger.info("Ribbon disappeared - ending segment")
+                    self.ribbon_disappeared = True
+                    return False  # End segment
 
         # Check if segment should end
         return not self._should_end_segment()
@@ -91,7 +109,7 @@ class SegmentDetector:
 
     def _should_end_segment(self) -> bool:
         """
-        Determine if current segment should end
+        Determine if current segment should end based on topic change or max duration
 
         Returns:
             bool: True if segment should end
@@ -99,29 +117,22 @@ class SegmentDetector:
         if not self.current_segment:
             return False
 
-        now = datetime.now()
+        now = now_wib()
         duration = (now - self.current_segment["start_time"]).total_seconds()
 
-        # Rule 1: Maximum duration exceeded
+        # Rule 1: Maximum duration exceeded (safety limit)
         if duration >= self.max_duration:
             logger.info(f"Segment ending: max duration reached ({duration}s)")
             return True
 
-        # Rule 2: Minimum duration not reached
+        # Rule 2: Minimum duration not reached yet
         if duration < self.min_duration:
             return False
 
-        # Rule 3: Ribbon text changed significantly
+        # Rule 3: Topic change detected (ribbon text berbeda signifikan)
         if self._detect_topic_change():
             logger.info("Segment ending: topic change detected")
             return True
-
-        # Rule 4: Idle threshold (no changes for X seconds)
-        if self.last_change_time:
-            idle_time = (now - self.last_change_time).total_seconds()
-            if idle_time >= self.idle_threshold:
-                logger.info(f"Segment ending: idle for {idle_time}s")
-                return True
 
         return False
 
@@ -145,8 +156,7 @@ class SegmentDetector:
         last = unique_ribbons[-1].lower().strip()
         previous = unique_ribbons[-2].lower().strip()
 
-        # Check if names/topics are different
-        # This is a simple approach, can be improved with NLP
+        # Check if names/topics are different (can be improved with NLP)
         common_words = set(last.split()) & set(previous.split())
         similarity = len(common_words) / max(len(last.split()), len(previous.split()))
 
@@ -164,7 +174,7 @@ class SegmentDetector:
             return None
 
         # Set end time
-        self.current_segment["end_time"] = datetime.now()
+        self.current_segment["end_time"] = now_wib()
         self.current_segment["status"] = "completed"
 
         # Calculate duration
@@ -209,7 +219,7 @@ class SegmentDetector:
         if not self.current_segment:
             return None
 
-        duration = (datetime.now() - self.current_segment["start_time"]).total_seconds()
+        duration = (now_wib() - self.current_segment["start_time"]).total_seconds()
 
         return {
             "segment_id": self.current_segment["segment_id"],

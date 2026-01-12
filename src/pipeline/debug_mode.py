@@ -1,32 +1,9 @@
 """
 Debug Pipeline Mode
 
-Continuous captur        logger.info("Initializing debug mode components...")
-
-        self.browser = StreamCapturer(config)
-        self.vision = MoondreamProcessor(config)
-        self.ocr = TesseractProcessor(config)
-        self.whisper = WhisperProcessor(config)
-
-        self.is_running = False
-        self.current_channel = None
-        self.start_time = None
-
-        self.stats = {
-            "frames_captured": 0,
-            "frames_processed": 0,
-            "vision_success": 0,
-            "vision_failures": 0,
-            "ocr_processed": 0,
-            "ocr_success": 0,
-            "ocr_failures": 0,
-            "audio_chunks": 0,
-            "audio_success": 0,
-            "total_confidence": 0.0,
-            "total_ocr_confidence": 0.0,
-            "vision_pending": 0,
-        }itoring.
-Auto-segmentation is disabled to focus on component quality and data collection.
+Continuous capture and monitoring for component testing.
+Focuses on YOLO ribbon detection quality and data collection.
+Auto-segmentation is disabled to focus on component quality.
 """
 
 import asyncio
@@ -118,10 +95,8 @@ class DebugOrchestrator:
         self.session_dir = self.output_dir / f"{channel_name.lower()}_{session_id}"
         self.session_dir.mkdir(parents=True, exist_ok=True)
         
-        # Create subdirectories
-        (self.session_dir / "frames").mkdir(exist_ok=True)
+        # Create subdirectories for outputs
         (self.session_dir / "audio").mkdir(exist_ok=True)
-        (self.session_dir / "vision").mkdir(exist_ok=True)
         (self.session_dir / "ocr").mkdir(exist_ok=True)
         (self.session_dir / "transcripts").mkdir(exist_ok=True)
 
@@ -150,7 +125,7 @@ class DebugOrchestrator:
         # Start monitoring display task
         monitor_task = asyncio.create_task(self._display_monitor())
         
-        # YOLO ribbon processing is inline (no background workers needed)
+        # YOLO ribbon processing
         worker_tasks = []
 
         # Start main debug loop
@@ -182,39 +157,28 @@ class DebugOrchestrator:
         """
         video_config = self.config.get("video", {})
         audio_config = self.config.get("audio", {})
-        vision_config = self.config.get("vision", {})
 
         frame_interval = 1.0 / video_config.get("fps_sample_rate", 0.5)  # seconds
         audio_interval = audio_config.get("chunk_duration", 30)  # seconds
-        vision_interval = vision_config.get("sample_interval", 60)  # seconds - Only send to Moondream every N seconds
 
         last_frame_time = 0
         last_audio_time = 0
-        last_vision_time = 0
 
         logger.info("Starting continuous capture loop...")
         logger.info(f"Frame capture: every {frame_interval:.1f}s")
-        logger.info(f"Vision processing: every {vision_interval}s (Moondream is slow on CPU)")
         logger.info(f"Audio capture: every {audio_interval}s")
 
         while self.is_running:
             current_time = time.time()
 
-            # Capture video frame (always - for frame archive)
+            # Capture video frame 
             if current_time - last_frame_time >= frame_interval:
                 logger.debug(f"[LOOP] Capturing frame at {current_time:.2f}")
-                # Check if should send to Moondream
-                send_to_vision = (current_time - last_vision_time >= vision_interval)
-                logger.debug(f"[LOOP] send_to_vision={send_to_vision}, vision_interval={vision_interval}, elapsed={current_time - last_vision_time:.2f}")
                 
-                await self._capture_and_process_frame(send_to_vision)
+                await self._capture_and_process_frame()
                 
                 logger.debug(f"[LOOP] Frame capture completed")
                 last_frame_time = current_time
-                
-                if send_to_vision:
-                    last_vision_time = current_time
-                    logger.debug(f"[LOOP] Updated last_vision_time to {last_vision_time:.2f}")
 
             # Process audio (placeholder)
             if current_time - last_audio_time >= audio_interval:
@@ -224,17 +188,14 @@ class DebugOrchestrator:
             # Small delay
             await asyncio.sleep(0.1)
 
-    async def _capture_and_process_frame(self, send_to_vision: bool = True):
+    async def _capture_and_process_frame(self):
         """
-        Capture frame and optionally queue for background processing
-        
-        Args:
-            send_to_vision: Whether to send this frame to Moondream (default: True)
+        Capture frame and process with YOLO ribbon detection
         """
         try:
-            logger.debug(f"[CAPTURE] Starting capture, send_to_vision={send_to_vision}")
+            logger.debug(f"[CAPTURE] Starting frame capture")
             
-            # Capture frame (fast operation)
+            # Capture frame 
             frame_data = await self.browser.capture_frame()
             self.stats["frames_captured"] += 1
             
@@ -246,29 +207,8 @@ class DebugOrchestrator:
 
             frame_number = self.stats["frames_captured"]
             
-            # Save frame immediately if enabled (fast)
-            frame_path = None
-            if self.save_frames:
-                frame_filename = f"frame_{frame_number:06d}.png"
-                frame_path = self.session_dir / "frames" / frame_filename
-                frame_path.write_bytes(frame_data)
-                logger.debug(f"[CAPTURE] Frame saved to {frame_filename}")
-
-            # ALWAYS: Run fast OCR for ribbon text
+            # Run YOLO + OCR for ribbon detection
             await self._process_with_yolo_ribbon(frame_number, frame_data)
-
-            # SOMETIMES: Queue for slow Moondream processing
-            if send_to_vision:
-                logger.debug(f"[CAPTURE] Queuing frame {frame_number} for Moondream")
-                await self.vision_queue.put({
-                    "frame_number": frame_number,
-                    "frame_data": frame_data,
-                    "frame_path": frame_path,
-                })
-                self.stats["vision_pending"] += 1
-                logger.debug(f"[CAPTURE] Frame {frame_number} queued, pending={self.stats['vision_pending']}")
-            else:
-                logger.debug(f"[CAPTURE] Frame {frame_number} NOT queued (waiting for sample interval)")
 
         except Exception as e:
             logger.error(f"ERROR: Frame capture error: {e}", exc_info=True)
@@ -332,78 +272,20 @@ class DebugOrchestrator:
                 frame_path = self.session_dir / "ocr" / frame_filename
                 cv2.imwrite(str(frame_path), result["annotated_frame"])
             
+            # Display ribbon detection events
             text = result.get("text", "")
-            logger.info(f"Frame {frame_number} [{change_type}]: {text[:60]}")
+            if change_type == "new":
+                logger.info(f"[RIBBON DETECTED] Frame {frame_number}: {text[:80]}")
+            elif change_type == "changed":
+                logger.info(f"[RIBBON CHANGED] Frame {frame_number}: {text[:80]}")
+            elif change_type == "disappeared":
+                logger.info(f"[RIBBON DISAPPEARED] Frame {frame_number}")
+            else:
+                logger.info(f"[RIBBON] Frame {frame_number} [{change_type}]: {text[:60]}")
                 
         except Exception as e:
             logger.error(f"ERROR: YOLO ribbon processing failed for frame {frame_number}: {e}")
     
-    async def _vision_worker(self, worker_id: int):
-        """Background worker for Moondream processing"""
-        logger.info(f"Vision worker {worker_id} started")
-        
-        while self.is_running:
-            try:
-                # Get frame from queue (with timeout to allow graceful shutdown)
-                try:
-                    frame_info = await asyncio.wait_for(
-                        self.vision_queue.get(), timeout=1.0
-                    )
-                except asyncio.TimeoutError:
-                    continue
-                
-                frame_number = frame_info["frame_number"]
-                frame_data = frame_info["frame_data"]
-                
-                logger.debug(f"Worker {worker_id}: Processing frame {frame_number}")
-                
-                # Process with Moondream in thread executor (blocking call!)
-                # This prevents blocking the async event loop
-                loop = asyncio.get_event_loop()
-                vision_result = await loop.run_in_executor(
-                    None,  # Use default ThreadPoolExecutor
-                    self.vision.process_frame,
-                    frame_data
-                )
-                
-                if vision_result:
-                    self.stats["frames_processed"] += 1
-                    
-                    # Check if fallback mode
-                    if not vision_result.get("fallback_mode", False):
-                        self.stats["vision_success"] += 1
-                        
-                        # Track confidence
-                        ribbon_conf = vision_result.get("ribbon_info", {}).get("confidence", 0.0)
-                        scene_conf = vision_result.get("scene_analysis", {}).get("confidence", 0.0)
-                        avg_conf = (ribbon_conf + scene_conf) / 2
-                        self.stats["total_confidence"] += avg_conf
-                    else:
-                        logger.debug("Moondream in fallback mode")
-                    
-                    # Save vision result
-                    vision_filename = f"vision_{frame_number:06d}.json"
-                    vision_path = self.session_dir / "vision" / vision_filename
-                    vision_path.write_text(json.dumps(vision_result, indent=2))
-                    
-                    # Add to history
-                    self.vision_history.append(vision_result)
-                    self.last_vision_result = vision_result
-                    
-                else:
-                    self.stats["vision_failures"] += 1
-                
-                self.stats["vision_pending"] -= 1
-                self.vision_queue.task_done()
-                
-            except asyncio.CancelledError:
-                logger.info(f"Vision worker {worker_id} cancelled")
-                break
-            except Exception as e:
-                logger.error(f"ERROR: Vision worker {worker_id} error: {e}")
-                self.stats["vision_failures"] += 1
-                self.stats["vision_pending"] -= 1
-
     async def _capture_and_process_audio(self):
         """Capture and process audio chunk (placeholder)"""
         try:

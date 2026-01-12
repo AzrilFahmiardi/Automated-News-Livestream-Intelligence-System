@@ -6,6 +6,21 @@ import logging
 import yaml
 from pathlib import Path
 from typing import Dict
+from datetime import datetime, timezone, timedelta
+
+
+# Timezone WIB (UTC+7)
+WIB = timezone(timedelta(hours=7))
+
+
+def now_wib() -> datetime:
+    """
+    Get current datetime in WIB timezone
+    
+    Returns:
+        datetime: Current time in WIB
+    """
+    return datetime.now(WIB)
 
 
 def load_config(config_path: str = "./config/settings.yaml") -> Dict:
