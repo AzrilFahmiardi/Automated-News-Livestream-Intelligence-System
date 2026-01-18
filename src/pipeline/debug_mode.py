@@ -59,7 +59,11 @@ class DebugOrchestrator:
             "ocr_extractions": 0,
             "audio_chunks": 0,
             "audio_success": 0,
+            "audio_failed": 0,
+            "transcription_success": 0,
+            "transcription_failed": 0,
             "total_confidence": 0.0,
+            "total_audio_duration": 0.0,
         }
 
         debug_config = config.get("debug", {})
@@ -74,7 +78,7 @@ class DebugOrchestrator:
         # Background processing queue
         self.vision_queue = asyncio.Queue()
         self.processing_tasks = []
-        self.audio_task = None  # Background audio processing task
+        self.audio_task = None  
 
         logger.info("Debug mode initialized successfully")
 
@@ -234,7 +238,7 @@ class DebugOrchestrator:
             frame_data: PNG image bytes
         """
         try:
-            # Run YOLO + OCR in thread executor (blocking call)
+            # Run YOLO + OCR in thread executor 
             loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(
                 None,
@@ -246,7 +250,6 @@ class DebugOrchestrator:
             self.stats["ribbon_detections"] += 1
             
             if result is None:
-                # No change detected, skip saving
                 return
             
             change_type = result.get("change_type")
@@ -274,7 +277,7 @@ class DebugOrchestrator:
                 "frame_number": frame_number
             }, indent=2))
             
-            # Save annotated frame (with bounding box)
+            # Save annotated frame 
             if result.get("annotated_frame") is not None:
                 import cv2
                 frame_filename = f"ribbon_{frame_number:06d}.png"
@@ -296,17 +299,101 @@ class DebugOrchestrator:
             logger.error(f"ERROR: YOLO ribbon processing failed for frame {frame_number}: {e}")
     
     async def _capture_and_process_audio(self):
-        """Capture and process audio chunk (placeholder)"""
+        """
+        Capture and process audio chunk from livestream.
+        
+        Records audio for the configured duration, then transcribes it using Whisper.
+        Saves both the audio file and transcription result.
+        """
         try:
-            # Note: Actual audio capture implementation would go here
-            # For now, this is a placeholder
+            audio_config = self.config.get("audio", {})
+            chunk_duration = audio_config.get("chunk_duration", 30)
             
             self.stats["audio_chunks"] += 1
+            chunk_number = self.stats["audio_chunks"]
             
-            logger.debug(f"DEBUG: Audio chunk {self.stats['audio_chunks']} (placeholder)")
+            # Prepare output paths
+            audio_filename = f"audio_{chunk_number:06d}.wav"
+            audio_path = self.session_dir / "audio" / audio_filename
+            
+            transcript_filename = f"transcript_{chunk_number:06d}.json"
+            transcript_path = self.session_dir / "transcripts" / transcript_filename
+            
+            logger.info(f"[AUDIO] Starting audio capture #{chunk_number} ({chunk_duration}s)...")
+            
+            # Start audio recording
+            recording_started = await self.browser.start_audio_recording(
+                str(audio_path),
+                duration=chunk_duration
+            )
+            
+            if not recording_started:
+                logger.error(f"[AUDIO] Failed to start recording #{chunk_number}")
+                self.stats["audio_failed"] += 1
+                return
+            
+            # Wait for recording to complete
+            logger.debug(f"[AUDIO] Recording in progress... ({chunk_duration}s)")
+            recorded_file = await self.browser.wait_for_audio_recording()
+            
+            if recorded_file is None or not recorded_file.exists():
+                logger.error(f"[AUDIO] Recording #{chunk_number} failed - no output file")
+                self.stats["audio_failed"] += 1
+                return
+            
+            # Check file size
+            file_size = recorded_file.stat().st_size
+            if file_size < 1000:  
+                logger.warning(f"[AUDIO] Recording #{chunk_number} too small ({file_size} bytes) - likely silent")
+                self.stats["audio_failed"] += 1
+                return
+            
+            logger.info(f"[AUDIO] Recording #{chunk_number} completed: {file_size:,} bytes")
+            self.stats["audio_success"] += 1
+            self.stats["total_audio_duration"] += chunk_duration
+            
+            # Transcribe audio if enabled
+            if self.save_audio:
+                logger.info(f"[AUDIO] Transcribing audio #{chunk_number}...")
+                
+                try:
+                    loop = asyncio.get_event_loop()
+                    transcription_result = await loop.run_in_executor(
+                        None,
+                        self.whisper.transcribe_audio_file,
+                        str(recorded_file)
+                    )
+                    
+                    if transcription_result and transcription_result.get("text"):
+                        # Save transcription
+                        import json
+                        transcript_data = {
+                            "chunk_number": chunk_number,
+                            "audio_file": audio_filename,
+                            "text": transcription_result["text"],
+                            "language": transcription_result.get("language", "id"),
+                            "duration": chunk_duration,
+                            "timestamp": transcription_result.get("timestamp"),
+                            "file_size_bytes": file_size
+                        }
+                        
+                        transcript_path.write_text(json.dumps(transcript_data, indent=2, ensure_ascii=False))
+                        
+                        text_preview = transcription_result["text"][:100]
+                        logger.info(f"[TRANSCRIPTION] #{chunk_number} SUCCESS: {text_preview}...")
+                        self.stats["transcription_success"] += 1
+                        
+                    else:
+                        logger.warning(f"[TRANSCRIPTION] #{chunk_number} returned empty result")
+                        self.stats["transcription_failed"] += 1
+                        
+                except Exception as e:
+                    logger.error(f"[TRANSCRIPTION] #{chunk_number} FAILED: {e}")
+                    self.stats["transcription_failed"] += 1
             
         except Exception as e:
-            logger.error(f"ERROR: Audio processing error: {e}")
+            logger.error(f"[AUDIO] Error in audio processing: {e}", exc_info=True)
+            self.stats["audio_failed"] += 1
 
     async def _display_monitor(self):
         """Display real-time monitoring dashboard"""
@@ -323,9 +410,19 @@ class DebugOrchestrator:
                 if self.stats["ocr_extractions"] > 0 else 0
             )
             
+            audio_success_rate = (
+                self.stats["audio_success"] / self.stats["audio_chunks"] * 100
+                if self.stats["audio_chunks"] > 0 else 0
+            )
+            
+            transcription_success_rate = (
+                self.stats["transcription_success"] / self.stats["audio_success"] * 100
+                if self.stats["audio_success"] > 0 else 0
+            )
+            
             # Display
             print("\n" + "=" * 80)
-            print("  LIVESTREAM INTELLIGENCE - DEBUG MODE (YOLO Ribbon)")
+            print("  LIVESTREAM INTELLIGENCE - DEBUG MODE")
             print(f"  Channel: {self.current_channel.get('name', 'Unknown')} | Runtime: {runtime_str}")
             print("=" * 80)
             print()
@@ -340,14 +437,19 @@ class DebugOrchestrator:
             print(f"   Total Frames: {self.stats['frames_captured']}")
             print(f"   FPS (actual): {fps_actual:.2f}")
             print()
-            print("AUDIO (Whisper)")
-            print(f"   Chunks Processed: {self.stats['audio_chunks']}")
-            print(f"   Status: {'OK' if self.stats['audio_chunks'] > 0 else 'Waiting'}")
+            print("AUDIO CAPTURE & TRANSCRIPTION (Whisper)")
+            print(f"   Audio Chunks: {self.stats['audio_chunks']}")
+            print(f"   Recording Success: {self.stats['audio_success']} ({audio_success_rate:.1f}%)")
+            print(f"   Recording Failed: {self.stats['audio_failed']}")
+            print(f"   Transcription Success: {self.stats['transcription_success']} ({transcription_success_rate:.1f}%)")
+            print(f"   Transcription Failed: {self.stats['transcription_failed']}")
+            print(f"   Total Audio Duration: {self._format_duration(self.stats['total_audio_duration'])}")
             print()
             print("DATA SAVED")
             print(f"   Output: {self.session_dir}")
-            print(f"   Frames: {len(list((self.session_dir / 'frames').glob('*.png')))}")
             print(f"   Ribbons Saved: {len(list((self.session_dir / 'ocr').glob('ribbon_*.json')))}")
+            print(f"   Audio Files: {len(list((self.session_dir / 'audio').glob('audio_*.wav')))}")
+            print(f"   Transcripts: {len(list((self.session_dir / 'transcripts').glob('transcript_*.json')))}")
             print()
             print("[Press Ctrl+C to stop]")
             print("=" * 80)
@@ -364,6 +466,21 @@ class DebugOrchestrator:
         try:
             runtime = (datetime.now() - self.start_time).total_seconds()
             
+            avg_confidence = (
+                self.stats["total_confidence"] / self.stats["ocr_extractions"]
+                if self.stats["ocr_extractions"] > 0 else 0
+            )
+            
+            audio_success_rate = (
+                self.stats["audio_success"] / self.stats["audio_chunks"] * 100
+                if self.stats["audio_chunks"] > 0 else 0
+            )
+            
+            transcription_success_rate = (
+                self.stats["transcription_success"] / self.stats["audio_success"] * 100
+                if self.stats["audio_success"] > 0 else 0
+            )
+            
             report = {
                 "session": {
                     "channel": self.current_channel.get("name"),
@@ -374,14 +491,19 @@ class DebugOrchestrator:
                 "statistics": self.stats,
                 "metrics": {
                     "fps_actual": self.stats["frames_captured"] / runtime if runtime > 0 else 0,
-                    "success_rate": (
-                        self.stats["vision_success"] / self.stats["frames_processed"] * 100
-                        if self.stats["frames_processed"] > 0 else 0
+                    "ribbon_detection_rate": (
+                        self.stats["ribbon_changes"] / self.stats["ribbon_detections"] * 100
+                        if self.stats["ribbon_detections"] > 0 else 0
                     ),
-                    "avg_confidence": (
-                        self.stats["total_confidence"] / self.stats["vision_success"]
-                        if self.stats["vision_success"] > 0 else 0
-                    ),
+                    "avg_ribbon_confidence": avg_confidence,
+                    "audio_capture_success_rate": audio_success_rate,
+                    "transcription_success_rate": transcription_success_rate,
+                    "total_audio_duration_sec": self.stats["total_audio_duration"],
+                },
+                "output_files": {
+                    "ribbons": len(list((self.session_dir / "ocr").glob("ribbon_*.json"))),
+                    "audio_files": len(list((self.session_dir / "audio").glob("audio_*.wav"))),
+                    "transcripts": len(list((self.session_dir / "transcripts").glob("transcript_*.json"))),
                 },
                 "output_directory": str(self.session_dir),
             }
@@ -397,11 +519,24 @@ class DebugOrchestrator:
             print("SESSION SUMMARY")
             print("=" * 80)
             print(f"Runtime: {self._format_duration(runtime)}")
-            print(f"Frames Captured: {self.stats['frames_captured']}")
-            print(f"Vision Success: {self.stats['vision_success']}")
-            print(f"Success Rate: {report['metrics']['success_rate']:.1f}%")
-            print(f"Avg Confidence: {report['metrics']['avg_confidence']:.2f}")
-            print(f"Report: {report_path}")
+            print()
+            print("VISION:")
+            print(f"  Frames Captured: {self.stats['frames_captured']}")
+            print(f"  Ribbon Changes: {self.stats['ribbon_changes']}")
+            print(f"  OCR Extractions: {self.stats['ocr_extractions']}")
+            print(f"  Avg Confidence: {avg_confidence:.2f}")
+            print()
+            print("AUDIO:")
+            print(f"  Audio Chunks: {self.stats['audio_chunks']}")
+            print(f"  Recording Success: {self.stats['audio_success']} ({audio_success_rate:.1f}%)")
+            print(f"  Transcription Success: {self.stats['transcription_success']} ({transcription_success_rate:.1f}%)")
+            print(f"  Total Audio Duration: {self._format_duration(self.stats['total_audio_duration'])}")
+            print()
+            print("OUTPUT:")
+            print(f"  Ribbon Files: {report['output_files']['ribbons']}")
+            print(f"  Audio Files: {report['output_files']['audio_files']}")
+            print(f"  Transcript Files: {report['output_files']['transcripts']}")
+            print(f"  Location: {report_path.parent}")
             print("=" * 80)
             
         except Exception as e:
