@@ -74,6 +74,7 @@ class DebugOrchestrator:
         # Background processing queue
         self.vision_queue = asyncio.Queue()
         self.processing_tasks = []
+        self.audio_task = None  # Background audio processing task
 
         logger.info("Debug mode initialized successfully")
 
@@ -141,6 +142,11 @@ class DebugOrchestrator:
             monitor_task.cancel()
             for task in worker_tasks:
                 task.cancel()
+            
+            # Cancel audio task if running
+            if self.audio_task and not self.audio_task.done():
+                self.audio_task.cancel()
+                
             await self.browser.close()
             
             # Save final report
@@ -182,7 +188,10 @@ class DebugOrchestrator:
 
             # Process audio (placeholder)
             if current_time - last_audio_time >= audio_interval:
-                await self._capture_and_process_audio()
+                # Start audio processing as background task (non-blocking)
+                if self.audio_task is None or self.audio_task.done():
+                    logger.debug(f"[LOOP] Starting audio task")
+                    self.audio_task = asyncio.create_task(self._capture_and_process_audio())
                 last_audio_time = current_time
 
             # Small delay
