@@ -50,7 +50,10 @@ llm:
 segment:
   min_duration: 30  
   max_duration: 600 
-  idle_threshold: 60 
+  idle_threshold: 60
+  ribbon_disappear_threshold: 3  # frames without ribbon before considering it disappeared
+  compilation_min_ribbons: 3     # minimum ribbons to be considered a compilation
+  compilation_max_interval: 25   # max avg seconds between ribbons to be compilation
 
 # Output Settings
 output:

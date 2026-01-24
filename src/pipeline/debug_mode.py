@@ -2,8 +2,7 @@
 Debug Pipeline Mode
 
 Continuous capture and monitoring for component testing.
-Focuses on YOLO ribbon detection quality and data collection.
-Auto-segmentation is disabled to focus on component quality.
+Includes segment detection and LLM processing for end-to-end testing.
 """
 
 import asyncio
@@ -17,19 +16,21 @@ import time
 from ..browser import StreamCapturer
 from ..vision import YOLORibbonProcessor
 from ..audio import WhisperProcessor
+from ..llm import LlamaReasoning
+from ..segment import SegmentDetector, SegmentData
 
 logger = logging.getLogger(__name__)
 
 
 class DebugOrchestrator:
     """
-    Debug mode pipeline for component testing and data collection.
+    Debug mode pipeline for component testing and segment processing.
     
     Features:
-    - Continuous capture without auto-segmentation
+    - State machine based segment detection
     - Real-time console monitoring
-    - Raw data export for frames, audio, and vision results
-    - Quality metrics tracking
+    - LLM processing for segment finalization
+    - JSON output generation
     """
 
     def __init__(self, config: dict):
@@ -46,6 +47,8 @@ class DebugOrchestrator:
         self.browser = StreamCapturer(config)
         self.ribbon_detector = YOLORibbonProcessor(config)
         self.whisper = WhisperProcessor(config)
+        self.llm = LlamaReasoning(config)
+        self.segment_detector = SegmentDetector(config)
 
         self.is_running = False
         self.current_channel = None
@@ -62,12 +65,15 @@ class DebugOrchestrator:
             "audio_failed": 0,
             "transcription_success": 0,
             "transcription_failed": 0,
+            "segments_completed": 0,
+            "segments_discarded": 0,
             "total_confidence": 0.0,
             "total_audio_duration": 0.0,
         }
 
         debug_config = config.get("debug", {})
         self.output_dir = Path(debug_config.get("output_dir", "./output/debug"))
+        self.segments_dir = Path(config.get("output", {}).get("directory", "./output/segments"))
         self.save_frames = debug_config.get("save_frames", True)
         self.save_audio = debug_config.get("save_audio", True)
         
@@ -75,7 +81,6 @@ class DebugOrchestrator:
         self.audio_history = []
         self.last_vision_result = None
         
-        # Background processing queue
         self.vision_queue = asyncio.Queue()
         self.processing_tasks = []
         self.audio_task = None  
@@ -95,10 +100,16 @@ class DebugOrchestrator:
 
         self.start_time = datetime.now()
         
+        # Setup segment detector with channel
+        self.segment_detector.set_channel(channel_name)
+        
         # Create session directory
         session_id = self.start_time.strftime("%Y%m%d_%H%M%S")
         self.session_dir = self.output_dir / f"{channel_name.lower()}_{session_id}"
         self.session_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Ensure segments output directory exists
+        self.segments_dir.mkdir(parents=True, exist_ok=True)
         
         # Create subdirectories for outputs
         (self.session_dir / "audio").mkdir(exist_ok=True)
@@ -109,37 +120,30 @@ class DebugOrchestrator:
         logger.info("DEBUG MODE STARTED")
         logger.info(f"Channel: {channel_name}")
         logger.info(f"URL: {channel_url}")
-        logger.info(f"Output: {self.session_dir}")
-        logger.info("Auto-segmentation: DISABLED")
+        logger.info(f"Debug Output: {self.session_dir}")
+        logger.info(f"Segments Output: {self.segments_dir}")
+        logger.info(f"Segment Detection: ENABLED (state={self.segment_detector.get_state()})")
         logger.info("=" * 80)
 
-        # Initialize browser
         await self.browser.initialize()
 
-        # Open livestream
         success = await self.browser.open_livestream(channel_url)
         if not success:
-            logger.error("ERROR: Failed to open livestream")
+            logger.error("Failed to open livestream")
             return
 
         self.is_running = True
 
-        # Start keep-alive task
         keep_alive_task = asyncio.create_task(self.browser.keep_alive())
-        
-        # Start monitoring display task
         monitor_task = asyncio.create_task(self._display_monitor())
-        
-        # YOLO ribbon processing
         worker_tasks = []
 
-        # Start main debug loop
         try:
             await self._debug_loop(channel_name)
         except KeyboardInterrupt:
             logger.info("\nInterrupted by user")
         except Exception as e:
-            logger.error(f"ERROR: Debug pipeline error: {e}", exc_info=True)
+            logger.error(f"Debug pipeline error: {e}", exc_info=True)
         finally:
             self.is_running = False
             keep_alive_task.cancel()
@@ -147,7 +151,6 @@ class DebugOrchestrator:
             for task in worker_tasks:
                 task.cancel()
             
-            # Cancel audio task if running
             if self.audio_task and not self.audio_task.done():
                 self.audio_task.cancel()
                 
@@ -190,9 +193,8 @@ class DebugOrchestrator:
                 logger.debug(f"[LOOP] Frame capture completed")
                 last_frame_time = current_time
 
-            # Process audio (placeholder)
+            # Process audio 
             if current_time - last_audio_time >= audio_interval:
-                # Start audio processing as background task (non-blocking)
                 if self.audio_task is None or self.audio_task.done():
                     logger.debug(f"[LOOP] Starting audio task")
                     self.audio_task = asyncio.create_task(self._capture_and_process_audio())
@@ -224,21 +226,17 @@ class DebugOrchestrator:
             await self._process_with_yolo_ribbon(frame_number, frame_data)
 
         except Exception as e:
-            logger.error(f"ERROR: Frame capture error: {e}", exc_info=True)
+            logger.error(f"Frame capture error: {e}", exc_info=True)
     
     async def _process_with_yolo_ribbon(self, frame_number: int, frame_data: bytes):
         """
-        Process frame with YOLO ribbon detection + OCR.
-        
-        Only performs OCR when ribbon changes (new, moved, or disappeared).
-        Runs in thread executor to avoid blocking.
+        Process frame with YOLO ribbon detection + OCR and segment detection.
         
         Args:
             frame_number: Sequential frame number
             frame_data: PNG image bytes
         """
         try:
-            # Run YOLO + OCR in thread executor 
             loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(
                 None,
@@ -246,8 +244,11 @@ class DebugOrchestrator:
                 frame_data
             )
             
-            # Update detection stats
             self.stats["ribbon_detections"] += 1
+            
+            # Process segment detection
+            segment_event = self.segment_detector.process_vision_result(result)
+            await self._handle_segment_event(segment_event, frame_number)
             
             if result is None:
                 return
@@ -259,7 +260,11 @@ class DebugOrchestrator:
                 logger.info(f"Frame {frame_number}: Ribbon disappeared")
                 return
             
-            # Ribbon changed (new or position/text change)
+            # Only save OCR result if we have valid ribbon data with text
+            if "text" not in result:
+                logger.debug(f"Frame {frame_number}: Result has no text field, skipping save")
+                return
+            
             self.stats["ribbon_changes"] += 1
             self.stats["ocr_extractions"] += 1
             self.stats["total_confidence"] += result.get("confidence", 0.0)
@@ -269,34 +274,155 @@ class DebugOrchestrator:
             ocr_path = self.session_dir / "ocr" / ocr_filename
             
             ocr_path.write_text(json.dumps({
-                "text": result["text"],
-                "bbox": result["bbox"],
-                "confidence": result["confidence"],
+                "text": result.get("text", ""),
+                "bbox": result.get("bbox"),
+                "confidence": result.get("confidence", 0.0),
                 "change_type": change_type,
-                "method": result["method"],
+                "method": result.get("method", "yolo_ribbon_ocr"),
                 "frame_number": frame_number
             }, indent=2))
             
-            # Save annotated frame 
             if result.get("annotated_frame") is not None:
                 import cv2
                 frame_filename = f"ribbon_{frame_number:06d}.png"
                 frame_path = self.session_dir / "ocr" / frame_filename
                 cv2.imwrite(str(frame_path), result["annotated_frame"])
             
-            # Display ribbon detection events
             text = result.get("text", "")
             if change_type == "new":
-                logger.info(f"[RIBBON DETECTED] Frame {frame_number}: {text[:80]}")
+                logger.info(f"[RIBBON NEW] Frame {frame_number}: {text[:80]}")
             elif change_type == "changed":
                 logger.info(f"[RIBBON CHANGED] Frame {frame_number}: {text[:80]}")
-            elif change_type == "disappeared":
-                logger.info(f"[RIBBON DISAPPEARED] Frame {frame_number}")
-            else:
-                logger.info(f"[RIBBON] Frame {frame_number} [{change_type}]: {text[:60]}")
                 
         except Exception as e:
-            logger.error(f"ERROR: YOLO ribbon processing failed for frame {frame_number}: {e}")
+            logger.error(f"YOLO ribbon processing failed for frame {frame_number}: {e}")
+
+    async def _handle_segment_event(self, event: Dict, frame_number: int):
+        """
+        Handle segment detection events.
+        
+        Args:
+            event: Segment event dict from SegmentDetector
+            frame_number: Current frame number
+        """
+        action = event.get("action")
+        
+        if action == "start_segment":
+            segment = event.get("segment")
+            logger.info(f"[SEGMENT START] {segment.segment_id} at frame {frame_number}")
+            
+        elif action == "end_segment":
+            segment = event.get("segment")
+            logger.info(f"[SEGMENT END] {segment.segment_id} at frame {frame_number} "
+                       f"(duration={segment.duration_sec}s, ribbons={len(segment.ribbon_texts)})")
+            
+            # Process segment with LLM in background
+            asyncio.create_task(self._finalize_segment(segment))
+            
+        elif action == "discard":
+            segment = event.get("segment")
+            reason = event.get("reason", "unknown")
+            logger.info(f"[SEGMENT DISCARD] {segment.segment_id} - {reason}")
+            self.stats["segments_discarded"] += 1
+            
+        elif action == "ready":
+            logger.info(f"[SEGMENT] Ready for new segments (cold start complete)")
+            
+        elif action == "skip":
+            logger.debug(f"[SEGMENT] Skipping - {event.get('reason', 'cold_start')}")
+
+    async def _finalize_segment(self, segment: SegmentData):
+        """
+        Finalize segment: run LLM processing and save JSON output.
+        
+        Args:
+            segment: Completed segment data
+        """
+        try:
+            logger.info(f"Processing segment {segment.segment_id} with LLM...")
+            
+            # Combine audio transcriptions
+            speech_text = " ".join(
+                [chunk.get("text", "") for chunk in segment.audio_chunks]
+            ).strip()
+            
+            if not speech_text:
+                speech_text = ""
+            
+            # Run LLM extraction
+            loop = asyncio.get_event_loop()
+            content_data = await loop.run_in_executor(
+                None,
+                self.llm.extract_news_segment,
+                speech_text,
+                segment.ribbon_texts,
+                segment.channel
+            )
+            
+            # Build output JSON
+            output = self._build_output_json(segment, content_data)
+            
+            # Save segment
+            self._save_segment(output)
+            
+            self.stats["segments_completed"] += 1
+            logger.info(f"Segment {segment.segment_id} saved successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to finalize segment {segment.segment_id}: {e}", exc_info=True)
+
+    def _build_output_json(self, segment: SegmentData, content_data: Dict) -> Dict:
+        """
+        Build final JSON output structure.
+        
+        Args:
+            segment: Segment data
+            content_data: LLM extracted content
+            
+        Returns:
+            dict: Final output structure
+        """
+        return {
+            "segment": {
+                "channel": segment.channel,
+                "segment_id": segment.segment_id,
+                "start_time": segment.start_time.isoformat(),
+                "end_time": segment.end_time.isoformat() if segment.end_time else None,
+                "duration_sec": segment.duration_sec,
+            },
+            "content": {
+                "title": content_data.get("title", ""),
+                "actors": content_data.get("actors"),  # Will be None if no valid actors
+                "summary": content_data.get("summary", {"short": "", "full": ""}),
+                "topics": content_data.get("topics", []),
+            },
+            "raw": {
+                "speech_text": " ".join(
+                    [chunk.get("text", "") for chunk in segment.audio_chunks]
+                ),
+                "ribbon_texts": segment.ribbon_texts,
+            },
+        }
+
+    def _save_segment(self, output: Dict):
+        """
+        Save segment to JSON file.
+        
+        Args:
+            output: Output data dict
+        """
+        try:
+            segment_id = output["segment"]["segment_id"]
+            filename = f"{segment_id}.json"
+            filepath = self.segments_dir / filename
+
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(output, f, ensure_ascii=False, indent=2)
+
+            logger.info(f"Saved segment to: {filepath}")
+
+        except Exception as e:
+            logger.error(f"Failed to save segment: {e}")
     
     async def _capture_and_process_audio(self):
         """
@@ -332,7 +458,6 @@ class DebugOrchestrator:
                 self.stats["audio_failed"] += 1
                 return
             
-            # Wait for recording to complete
             logger.debug(f"[AUDIO] Recording in progress... ({chunk_duration}s)")
             recorded_file = await self.browser.wait_for_audio_recording()
             
@@ -341,10 +466,9 @@ class DebugOrchestrator:
                 self.stats["audio_failed"] += 1
                 return
             
-            # Check file size
             file_size = recorded_file.stat().st_size
             if file_size < 1000:  
-                logger.warning(f"[AUDIO] Recording #{chunk_number} too small ({file_size} bytes) - likely silent")
+                logger.warning(f"[AUDIO] Recording #{chunk_number} too small ({file_size} bytes)")
                 self.stats["audio_failed"] += 1
                 return
             
@@ -352,7 +476,6 @@ class DebugOrchestrator:
             self.stats["audio_success"] += 1
             self.stats["total_audio_duration"] += chunk_duration
             
-            # Transcribe audio if enabled
             if self.save_audio:
                 logger.info(f"[AUDIO] Transcribing audio #{chunk_number}...")
                 
@@ -365,8 +488,6 @@ class DebugOrchestrator:
                     )
                     
                     if transcription_result and transcription_result.get("text"):
-                        # Save transcription
-                        import json
                         transcript_data = {
                             "chunk_number": chunk_number,
                             "audio_file": audio_filename,
@@ -378,6 +499,9 @@ class DebugOrchestrator:
                         }
                         
                         transcript_path.write_text(json.dumps(transcript_data, indent=2, ensure_ascii=False))
+                        
+                        # Add to current segment if recording
+                        self.segment_detector.add_audio_chunk(transcript_data)
                         
                         text_preview = transcription_result["text"][:100]
                         logger.info(f"[TRANSCRIPTION] #{chunk_number} SUCCESS: {text_preview}...")
@@ -420,11 +544,24 @@ class DebugOrchestrator:
                 if self.stats["audio_success"] > 0 else 0
             )
             
-            # Display
+            # Get segment info
+            segment_state = self.segment_detector.get_state()
+            segment_progress = self.segment_detector.get_segment_progress()
+            
             print("\n" + "=" * 80)
             print("  LIVESTREAM INTELLIGENCE - DEBUG MODE")
             print(f"  Channel: {self.current_channel.get('name', 'Unknown')} | Runtime: {runtime_str}")
             print("=" * 80)
+            print()
+            print("SEGMENT DETECTION")
+            print(f"   State: {segment_state.upper()}")
+            if segment_progress:
+                print(f"   Current Segment: {segment_progress['segment_id']}")
+                print(f"   Duration: {segment_progress['duration']}s")
+                print(f"   Ribbons: {segment_progress['ribbon_count']}")
+                print(f"   Audio Chunks: {segment_progress['audio_chunks']}")
+            print(f"   Segments Completed: {self.stats['segments_completed']}")
+            print(f"   Segments Discarded: {self.stats['segments_discarded']}")
             print()
             print("RIBBON DETECTION (YOLO + EasyOCR)")
             print(f"   Frames Scanned: {self.stats['ribbon_detections']}")
@@ -445,11 +582,11 @@ class DebugOrchestrator:
             print(f"   Transcription Failed: {self.stats['transcription_failed']}")
             print(f"   Total Audio Duration: {self._format_duration(self.stats['total_audio_duration'])}")
             print()
-            print("DATA SAVED")
-            print(f"   Output: {self.session_dir}")
+            print("OUTPUT")
+            print(f"   Debug: {self.session_dir}")
+            print(f"   Segments: {self.segments_dir}")
             print(f"   Ribbons Saved: {len(list((self.session_dir / 'ocr').glob('ribbon_*.json')))}")
-            print(f"   Audio Files: {len(list((self.session_dir / 'audio').glob('audio_*.wav')))}")
-            print(f"   Transcripts: {len(list((self.session_dir / 'transcripts').glob('transcript_*.json')))}")
+            print(f"   Segment Files: {len(list(self.segments_dir.glob('*.json')))}")
             print()
             print("[Press Ctrl+C to stop]")
             print("=" * 80)
@@ -500,25 +637,34 @@ class DebugOrchestrator:
                     "transcription_success_rate": transcription_success_rate,
                     "total_audio_duration_sec": self.stats["total_audio_duration"],
                 },
+                "segment_detection": {
+                    "segments_completed": self.stats["segments_completed"],
+                    "segments_discarded": self.stats["segments_discarded"],
+                    "final_state": self.segment_detector.get_state(),
+                },
                 "output_files": {
                     "ribbons": len(list((self.session_dir / "ocr").glob("ribbon_*.json"))),
                     "audio_files": len(list((self.session_dir / "audio").glob("audio_*.wav"))),
                     "transcripts": len(list((self.session_dir / "transcripts").glob("transcript_*.json"))),
+                    "segments": len(list(self.segments_dir.glob("*.json"))),
                 },
                 "output_directory": str(self.session_dir),
+                "segments_directory": str(self.segments_dir),
             }
             
-            # Save report
             report_path = self.session_dir / "session_report.json"
             report_path.write_text(json.dumps(report, indent=2))
             
             logger.info(f"Session report saved: {report_path}")
             
-            # Print summary
             print("\n" + "=" * 80)
             print("SESSION SUMMARY")
             print("=" * 80)
             print(f"Runtime: {self._format_duration(runtime)}")
+            print()
+            print("SEGMENTS:")
+            print(f"  Completed: {self.stats['segments_completed']}")
+            print(f"  Discarded: {self.stats['segments_discarded']}")
             print()
             print("VISION:")
             print(f"  Frames Captured: {self.stats['frames_captured']}")
@@ -533,10 +679,9 @@ class DebugOrchestrator:
             print(f"  Total Audio Duration: {self._format_duration(self.stats['total_audio_duration'])}")
             print()
             print("OUTPUT:")
-            print(f"  Ribbon Files: {report['output_files']['ribbons']}")
-            print(f"  Audio Files: {report['output_files']['audio_files']}")
-            print(f"  Transcript Files: {report['output_files']['transcripts']}")
-            print(f"  Location: {report_path.parent}")
+            print(f"  Debug: {self.session_dir}")
+            print(f"  Segments: {self.segments_dir}")
+            print(f"  Segment Files: {report['output_files']['segments']}")
             print("=" * 80)
             
         except Exception as e:

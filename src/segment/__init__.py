@@ -1,230 +1,365 @@
 """
 Segment Detection Module
-Heuristic-based detection of news segment boundaries
+
+State machine based detection of news segment boundaries.
+Handles cold start, segment recording, and segment finalization.
 """
 
 import logging
-from datetime import datetime, timedelta
-from typing import Optional, List, Dict
-from collections import deque
+from enum import Enum
+from datetime import datetime
+from typing import Optional, Dict, List
+from dataclasses import dataclass, field
+
 from ..utils import now_wib
 
 logger = logging.getLogger(__name__)
 
 
+class SegmentState(Enum):
+    """Segment detector states"""
+    COLD_START = "cold_start"
+    IDLE = "idle"
+    RECORDING = "recording"
+
+
+@dataclass
+class SegmentData:
+    """Data container for a single news segment"""
+    segment_id: str
+    channel: str
+    start_time: datetime
+    end_time: Optional[datetime] = None
+    duration_sec: int = 0
+    ribbon_texts: List[Dict] = field(default_factory=list)
+    audio_chunks: List[Dict] = field(default_factory=list)
+    status: str = "active"
+
+
 class SegmentDetector:
-    """Detects news segment boundaries using heuristic rules"""
+    """
+    State machine based news segment detector.
+    
+    States:
+        COLD_START: Program just started, skip first partial segment
+        IDLE: No active segment, waiting for new ribbon
+        RECORDING: Active segment, collecting data
+    
+    Transitions:
+        COLD_START + ribbon_detected -> COLD_START (wait for disappear)
+        COLD_START + ribbon_disappeared -> IDLE (ready for new segment)
+        IDLE + ribbon_detected -> RECORDING (start new segment)
+        IDLE + no_ribbon -> IDLE (stay idle)
+        RECORDING + ribbon_detected -> RECORDING (add data)
+        RECORDING + ribbon_disappeared -> IDLE (end segment)
+    """
 
     def __init__(self, config: dict):
+        """
+        Initialize segment detector.
+        
+        Args:
+            config: System configuration dictionary
+        """
         self.config = config
         segment_config = config.get("segment", {})
 
-        self.min_duration = segment_config.get("min_duration", 30)  # seconds
-        self.max_duration = segment_config.get("max_duration", 600)  # seconds
-        self.idle_threshold = segment_config.get("idle_threshold", 10)  # seconds
+        self.min_duration = segment_config.get("min_duration", 30)
+        self.max_duration = segment_config.get("max_duration", 600)
+        self.ribbon_disappear_threshold = segment_config.get("ribbon_disappear_threshold", 3)
+        
+        # Compilation detection thresholds
+        self.compilation_min_ribbons = segment_config.get("compilation_min_ribbons", 3)
+        self.compilation_max_interval = segment_config.get("compilation_max_interval", 25)  # seconds
 
-        # State tracking
-        self.current_segment = None
-        self.ribbon_history = deque(maxlen=10)  
-        self.last_change_time = None
-        self.ribbon_disappeared = False  
-        self.frames_without_ribbon = 0  
+        self.state = SegmentState.COLD_START
+        self.current_segment: Optional[SegmentData] = None
+        self.frames_without_ribbon = 0
+        self.frames_without_ribbon_at_start = 0  
+        self.cold_start_ribbon_seen = False
 
-        logger.info("Segment Detector initialized")
+        logger.info(f"SegmentDetector initialized (state={self.state.value})")
+        logger.info(f"Config: min_duration={self.min_duration}s, "
+                   f"max_duration={self.max_duration}s, "
+                   f"disappear_threshold={self.ribbon_disappear_threshold} frames")
 
-    def start_segment(self, channel: str) -> Dict:
+    def process_vision_result(self, vision_result: Optional[Dict]) -> Dict:
         """
-        Start a new segment
-
+        Process vision result and determine segment action.
+        
         Args:
-            channel: Channel name
-
+            vision_result: YOLO+OCR result dict or None if no change/no ribbon
+            
         Returns:
-            dict: Segment metadata
+            dict: Action result with keys:
+                - action: "none", "skip", "start_segment", "add_data", "end_segment"
+                - segment: SegmentData if applicable
+                - reason: Optional explanation
+                
+        Note:
+            vision_result can be:
+            - None: No change detected (ribbon same as before OR no ribbon during IDLE)
+            - Dict with change_type="disappeared": Ribbon explicitly disappeared
+            - Dict with change_type="new"/"changed": New/changed ribbon with text
         """
-        segment_id = self._generate_segment_id(channel)
+        if vision_result and vision_result.get("change_type") == "disappeared":
+            return self._on_ribbon_disappeared()
+        
+        # Handle ribbon detected 
+        if vision_result and vision_result.get("change_type") in ("new", "changed"):
+            ribbon_data = {
+                "text": vision_result.get("text", ""),
+                "confidence": vision_result.get("confidence", 0.0),
+                "timestamp": now_wib().isoformat(),
+                "bbox": vision_result.get("bbox"),
+                "change_type": vision_result.get("change_type", "unknown")
+            }
+            return self._on_ribbon_detected(ribbon_data)
+        
+        if self.state == SegmentState.RECORDING:
+            self.frames_without_ribbon = 0
+            return {"action": "none", "reason": "ribbon_unchanged"}
+        
+        return self._on_no_ribbon()
 
-        self.current_segment = {
-            "segment_id": segment_id,
-            "channel": channel,
-            "start_time": now_wib(),
-            "end_time": None,
-            "ribbon_texts": [],
-            "audio_chunks": [],
-            "status": "active",
-        }
-
-        self.last_change_time = now_wib()
-        self.ribbon_history.clear()
-        self.ribbon_disappeared = False
+    def _on_ribbon_detected(self, ribbon_data: Dict) -> Dict:
+        """Handle ribbon detection event (new or changed ribbon)."""
         self.frames_without_ribbon = 0
 
-        logger.info(f"Started new segment: {segment_id}")
-        return self.current_segment
+        if self.state == SegmentState.COLD_START:
+            if not self.cold_start_ribbon_seen:
+                self.cold_start_ribbon_seen = True
+                
+                if self.frames_without_ribbon_at_start >= self.ribbon_disappear_threshold:
+                    logger.info("COLD_START (from ad break) -> RECORDING: Starting fresh segment")
+                    self._start_segment(ribbon_data)
+                    self.state = SegmentState.RECORDING
+                    return {
+                        "action": "start_segment",
+                        "segment": self.current_segment,
+                        "reason": "fresh_start_from_ad"
+                    }
+                else:
+                    logger.info("COLD_START: Ribbon detected mid-segment, waiting for disappear")
+                    return {"action": "skip", "reason": "cold_start_wait"}
+            else:
+                return {"action": "skip", "reason": "cold_start_wait"}
 
-    def add_ribbon_detection(self, ribbon_data: Optional[Dict]) -> bool:
-        """
-        Add ribbon OCR detection to current segment
+        elif self.state == SegmentState.IDLE:
+            self._start_segment(ribbon_data)
+            logger.info(f"IDLE -> RECORDING: Segment started ({self.current_segment.segment_id})")
+            return {
+                "action": "start_segment",
+                "segment": self.current_segment,
+                "reason": "new_ribbon"
+            }
 
-        Args:
-            ribbon_data: OCR result dict or None if no ribbon detected
-
-        Returns:
-            bool: True if segment should continue, False if should end
-        """
-        if not self.current_segment:
-            return False
-
-        # Track ribbon presence/absence
-        if ribbon_data and ribbon_data.get("text"):
-            # Ribbon detected
-            self.current_segment["ribbon_texts"].append(ribbon_data)
-            self.ribbon_history.append(ribbon_data["text"])
-            self.last_change_time = now_wib()
-            self.frames_without_ribbon = 0
-            self.ribbon_disappeared = False
-        else:
-            # No ribbon detected
-            self.frames_without_ribbon += 1
+        elif self.state == SegmentState.RECORDING:
+            self.current_segment.ribbon_texts.append(ribbon_data)
             
-            # Consider ribbon disappeared after 3 consecutive frames without detection
-            if self.frames_without_ribbon >= 3 and len(self.current_segment["ribbon_texts"]) > 0:
-                if not self.ribbon_disappeared:
-                    logger.info("Ribbon disappeared - ending segment")
-                    self.ribbon_disappeared = True
-                    return False  # End segment
+            if self._is_max_duration_exceeded():
+                logger.info("Max duration exceeded, forcing segment end")
+                return self._end_segment_and_return()
+            
+            return {"action": "add_data", "reason": "ribbon_added"}
 
-        # Check if segment should end
-        return not self._should_end_segment()
+        return {"action": "none"}
 
-    def add_audio_chunk(self, audio_data: Dict):
-        """
-        Add audio transcription to current segment
+    def _on_no_ribbon(self) -> Dict:
+        """Handle no ribbon detection event."""
+        self.frames_without_ribbon += 1
+        
+        if self.state == SegmentState.COLD_START and not self.cold_start_ribbon_seen:
+            self.frames_without_ribbon_at_start = self.frames_without_ribbon
 
-        Args:
-            audio_data: Whisper transcription result
-        """
-        if self.current_segment and audio_data:
-            self.current_segment["audio_chunks"].append(audio_data)
+        if self.frames_without_ribbon >= self.ribbon_disappear_threshold:
+            return self._on_ribbon_disappeared()
 
-    def _should_end_segment(self) -> bool:
-        """
-        Determine if current segment should end based on topic change or max duration
+        return {"action": "none", "reason": "waiting_for_threshold"}
 
-        Returns:
-            bool: True if segment should end
-        """
-        if not self.current_segment:
-            return False
+    def _on_ribbon_disappeared(self) -> Dict:
+        """Handle ribbon disappeared event (threshold reached)."""
+        if self.state == SegmentState.COLD_START:
+            if self.cold_start_ribbon_seen:
+                self.state = SegmentState.IDLE
+                logger.info("COLD_START -> IDLE: Ready for new segments")
+                return {"action": "ready", "reason": "cold_start_complete"}
+            else:
+                logger.debug("COLD_START: No ribbon seen yet (possibly ad break)")
+                return {"action": "none", "reason": "cold_start_no_ribbon"}
 
-        now = now_wib()
-        duration = (now - self.current_segment["start_time"]).total_seconds()
+        elif self.state == SegmentState.RECORDING:
+            return self._end_segment_and_return()
 
-        # Rule 1: Maximum duration exceeded (safety limit)
-        if duration >= self.max_duration:
-            logger.info(f"Segment ending: max duration reached ({duration}s)")
-            return True
+        elif self.state == SegmentState.IDLE:
+            return {"action": "none", "reason": "already_idle"}
 
-        # Rule 2: Minimum duration not reached yet
-        if duration < self.min_duration:
-            return False
+        return {"action": "none"}
 
-        # Rule 3: Topic change detected (ribbon text berbeda signifikan)
-        if self._detect_topic_change():
-            logger.info("Segment ending: topic change detected")
-            return True
+    def _start_segment(self, ribbon_data: Dict):
+        """Start a new segment."""
+        channel = self.config.get("_current_channel", "unknown")
+        segment_id = self._generate_segment_id(channel)
 
-        return False
-
-    def _detect_topic_change(self) -> bool:
-        """
-        Detect if topic changed based on ribbon text history
-
-        Returns:
-            bool: True if topic likely changed
-        """
-        if len(self.ribbon_history) < 2:
-            return False
-
-        # Get last two unique ribbon texts
-        unique_ribbons = list(dict.fromkeys(self.ribbon_history))
-
-        if len(unique_ribbons) < 2:
-            return False
-
-        # Simple heuristic: if last ribbon is completely different
-        last = unique_ribbons[-1].lower().strip()
-        previous = unique_ribbons[-2].lower().strip()
-
-        # Check if names/topics are different (can be improved with NLP)
-        common_words = set(last.split()) & set(previous.split())
-        similarity = len(common_words) / max(len(last.split()), len(previous.split()))
-
-        # If similarity < 30%, likely different topic
-        return similarity < 0.3
-
-    def end_segment(self) -> Optional[Dict]:
-        """
-        End current segment and return complete data
-
-        Returns:
-            dict: Complete segment data or None
-        """
-        if not self.current_segment:
-            return None
-
-        # Set end time
-        self.current_segment["end_time"] = now_wib()
-        self.current_segment["status"] = "completed"
-
-        # Calculate duration
-        duration = (
-            self.current_segment["end_time"] - self.current_segment["start_time"]
-        ).total_seconds()
-        self.current_segment["duration_sec"] = int(duration)
-
-        logger.info(
-            f"Ended segment {self.current_segment['segment_id']} "
-            f"(duration: {duration}s, ribbons: {len(self.current_segment['ribbon_texts'])})"
+        self.current_segment = SegmentData(
+            segment_id=segment_id,
+            channel=channel,
+            start_time=now_wib(),
+            ribbon_texts=[ribbon_data],
+            audio_chunks=[],
+            status="active"
         )
 
-        # Return and clear
+        self.state = SegmentState.RECORDING
+        self.frames_without_ribbon = 0
+
+    def _end_segment_and_return(self) -> Dict:
+        """End current segment and return result."""
+        if not self.current_segment:
+            self.state = SegmentState.IDLE
+            return {"action": "none", "reason": "no_segment_to_end"}
+
+        self.current_segment.end_time = now_wib()
+        self.current_segment.duration_sec = int(
+            (self.current_segment.end_time - self.current_segment.start_time).total_seconds()
+        )
+        self.current_segment.status = "completed"
+
+        if self.current_segment.duration_sec < self.min_duration:
+            logger.info(f"Segment too short ({self.current_segment.duration_sec}s), discarding")
+            segment = self.current_segment
+            self.current_segment = None
+            self.state = SegmentState.IDLE
+            return {"action": "discard", "segment": segment, "reason": "too_short"}
+
+        if not self.current_segment.ribbon_texts:
+            logger.info("Segment has no ribbon data, discarding")
+            segment = self.current_segment
+            self.current_segment = None
+            self.state = SegmentState.IDLE
+            return {"action": "discard", "segment": segment, "reason": "no_ribbons"}
+
+        if self._is_compilation_segment():
+            logger.info(f"Segment is a news compilation ({len(self.current_segment.ribbon_texts)} ribbons "
+                       f"in {self.current_segment.duration_sec}s), discarding")
+            segment = self.current_segment
+            self.current_segment = None
+            self.state = SegmentState.IDLE
+            return {"action": "discard", "segment": segment, "reason": "compilation"}
+
+        logger.info(f"RECORDING -> IDLE: Segment ended ({self.current_segment.segment_id}, "
+                   f"duration={self.current_segment.duration_sec}s, "
+                   f"ribbons={len(self.current_segment.ribbon_texts)})")
+
         segment = self.current_segment
         self.current_segment = None
-        self.ribbon_history.clear()
+        self.state = SegmentState.IDLE
 
-        return segment
+        return {
+            "action": "end_segment",
+            "segment": segment,
+            "reason": "ribbon_disappeared"
+        }
+
+    def _is_max_duration_exceeded(self) -> bool:
+        """Check if current segment exceeded max duration."""
+        if not self.current_segment:
+            return False
+        duration = (now_wib() - self.current_segment.start_time).total_seconds()
+        return duration >= self.max_duration
+
+    def _is_compilation_segment(self) -> bool:
+        """
+        Check if current segment is a news compilation/rundown.
+        
+        A compilation is detected when multiple different ribbons appear
+        within a short time period (e.g., headline rundown at start of news).
+        
+        Returns:
+            bool: True if segment appears to be a compilation
+        """
+        if not self.current_segment:
+            return False
+        
+        ribbons = self.current_segment.ribbon_texts
+        num_ribbons = len(ribbons)
+        
+        if num_ribbons < self.compilation_min_ribbons:
+            return False
+        
+        if num_ribbons < 2:
+            return False
+        
+        try:
+            from datetime import datetime as dt
+            
+            timestamps = []
+            for r in ribbons:
+                ts_str = r.get("timestamp", "")
+                if ts_str:
+                    ts = dt.fromisoformat(ts_str)
+                    timestamps.append(ts)
+            
+            if len(timestamps) < 2:
+                return False
+            
+            intervals = []
+            for i in range(1, len(timestamps)):
+                interval = (timestamps[i] - timestamps[i-1]).total_seconds()
+                intervals.append(interval)
+            
+            avg_interval = sum(intervals) / len(intervals)
+            
+            if avg_interval < self.compilation_max_interval:
+                logger.debug(f"Compilation detected: {num_ribbons} ribbons, "
+                           f"avg interval={avg_interval:.1f}s < {self.compilation_max_interval}s")
+                return True
+                
+        except Exception as e:
+            logger.warning(f"Error checking compilation: {e}")
+        
+        return False
 
     def _generate_segment_id(self, channel: str) -> str:
-        """
-        Generate unique segment ID
-
-        Args:
-            channel: Channel name
-
-        Returns:
-            str: Segment ID
-        """
+        """Generate unique segment ID."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        channel_clean = channel.lower().replace(" ", "")
+        channel_clean = channel.lower().replace(" ", "").replace("-", "")
         return f"{channel_clean}_{timestamp}"
 
-    def get_segment_progress(self) -> Optional[Dict]:
-        """
-        Get current segment progress info
+    def add_audio_chunk(self, audio_data: Dict):
+        """Add audio transcription to current segment."""
+        if self.current_segment and audio_data:
+            self.current_segment.audio_chunks.append(audio_data)
+            logger.debug(f"Audio chunk added (total: {len(self.current_segment.audio_chunks)})")
 
-        Returns:
-            dict: Progress info or None
-        """
+    def get_state(self) -> str:
+        """Get current state as string."""
+        return self.state.value
+
+    def get_segment_progress(self) -> Optional[Dict]:
+        """Get current segment progress info."""
         if not self.current_segment:
             return None
 
-        duration = (now_wib() - self.current_segment["start_time"]).total_seconds()
+        duration = (now_wib() - self.current_segment.start_time).total_seconds()
 
         return {
-            "segment_id": self.current_segment["segment_id"],
+            "segment_id": self.current_segment.segment_id,
             "duration": int(duration),
-            "ribbon_count": len(self.current_segment["ribbon_texts"]),
-            "audio_chunks": len(self.current_segment["audio_chunks"]),
-            "status": self.current_segment["status"],
+            "ribbon_count": len(self.current_segment.ribbon_texts),
+            "audio_chunks": len(self.current_segment.audio_chunks),
+            "status": self.current_segment.status,
         }
+
+    def set_channel(self, channel_name: str):
+        """Set current channel name for segment ID generation."""
+        self.config["_current_channel"] = channel_name
+
+    def reset(self):
+        """Reset detector to initial state."""
+        self.state = SegmentState.COLD_START
+        self.current_segment = None
+        self.frames_without_ribbon = 0
+        self.frames_without_ribbon_at_start = 0
+        self.cold_start_ribbon_seen = False
+        logger.info("SegmentDetector reset to COLD_START")

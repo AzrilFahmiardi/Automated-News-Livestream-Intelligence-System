@@ -120,19 +120,18 @@ class LlamaReasoning:
         system_prompt = """Anda adalah AI assistant yang bertugas menganalisis berita TV Indonesia dan mengekstrak informasi terstruktur.
 
 Tugas Anda:
-1. Ekstrak judul berita dari teks ribbon PERTAMA (WAJIB)
-2. Identifikasi aktor/tokoh dari ribbon berikutnya atau speech (jika ada)
-3. Buat ringkasan berita (pendek dan lengkap)
+1. Ekstrak judul berita dari teks ribbon PERTAMA
+2. Identifikasi aktor/tokoh yang disebutkan (jika ada)
+3. Buat ringkasan berita dari TRANSKRIP AUDIO
 4. Tentukan topik/kategori berita
 
 Output HARUS dalam format JSON yang valid:
 {
-  "title": "Judul berita dari ribbon pertama (WAJIB)",
+  "title": "Judul berita dari ribbon pertama",
   "actors": [
     {
       "name": "Nama lengkap aktor",
       "role": "Jabatan/peran",
-      "source": ["ribbon" atau "speech"],
       "confidence": 0.0-1.0
     }
   ],
@@ -143,32 +142,46 @@ Output HARUS dalam format JSON yang valid:
   "topics": ["topik1", "topik2"]
 }
 
-PENTING:
-- Field "title": WAJIB diisi dari ribbon pertama (biasanya huruf besar, pernyataan singkat)
-- Field "actors": Hanya isi jika ada aktor yang terdeteksi (nama orang/organisasi dengan/tanpa jabatan)
-- Ribbon pertama = judul berita
-- Ribbon berikutnya (jika ada) = bisa berisi aktor atau info tambahan
-- Jangan paksa ada aktor jika memang tidak disebutkan
+ATURAN KETAT:
+1. "title": Salin persis dari ribbon pertama (huruf kapital)
+2. "actors": Isi HANYA jika ada nama orang/tokoh. Jika tidak ada, gunakan array kosong []
+3. "summary": 
+   - Buat HANYA dari informasi di TRANSKRIP AUDIO
+   - JANGAN mengarang atau berasumsi informasi yang tidak ada di transkrip!
+   - JANGAN menyebut "transkrip audio", "dalam audio", atau sumber data apapun
+   - Tulis langsung isi beritanya saja
+   - Jika transkrip kosong/tidak tersedia, ISI DENGAN: {"short": null, "full": null}
+   - short = 1 kalimat inti
+   - full = 2-3 kalimat penjelasan
+4. "topics": Kata kunci dari berita (2-5 topik)
 
-Gunakan Bahasa Indonesia yang formal dan akurat."""
+DILARANG KERAS:
+- Mengarang informasi yang tidak ada di transkrip
+- Menyebut "berdasarkan transkrip", "dalam audio", dll di summary
+- Membuat summary jika transkrip kosong (gunakan null)
+
+Gunakan Bahasa Indonesia formal."""
 
         # User prompt with data
-        user_prompt = f"""Analisis segmen berita berikut dari channel {channel}:
+        has_transcript = bool(speech_text and speech_text.strip())
+        
+        user_prompt = f"""Analisis segmen berita dari channel {channel}:
 
 TRANSKRIP AUDIO:
-{speech_text[:2000]}  
+{speech_text[:2000] if has_transcript else "[KOSONG - tidak ada transkrip]"}
 
-TEKS RIBBON/LOWER-THIRD:
+TEKS RIBBON:
 {ribbon_context[:1000]}
 
-Ekstrak informasi terstruktur dalam format JSON."""
+Ekstrak informasi dalam format JSON.
+{"PENTING: Transkrip kosong, jadi summary short dan full HARUS null!" if not has_transcript else "Buat summary dari transkrip, jangan sebut sumber data."}"""
 
         # Generate
         response = self.generate(user_prompt, system_prompt)
 
         # Parse JSON
         try:
-            # Extract JSON from response (handle markdown code blocks)
+            # Extract JSON from response 
             json_text = response
             if "```json" in response:
                 json_text = response.split("```json")[1].split("```")[0].strip()
@@ -179,24 +192,27 @@ Ekstrak informasi terstruktur dalam format JSON."""
 
             # Validate and clean structure
             
-            # Title - required
+            # Title 
             if "title" not in data or not data["title"]:
-                # Extract from first ribbon if available
                 if ribbon_texts and len(ribbon_texts) > 0:
                     data["title"] = ribbon_texts[0].get("text", "")
                 else:
                     data["title"] = ""
             
-            # Actors - optional, remove if empty
-            if "actors" in data:
-                if not isinstance(data["actors"], list) or len(data["actors"]) == 0:
-                    del data["actors"]
+            # Actors
+            data["actors"] = self._clean_actors(data.get("actors"))
             
-            # Summary - required
-            if not isinstance(data.get("summary"), dict):
-                data["summary"] = {"short": "", "full": ""}
+            # Summary 
+            summary = data.get("summary")
+            if not isinstance(summary, dict):
+                data["summary"] = {"short": None, "full": None}
+            else:
+                data["summary"] = {
+                    "short": summary.get("short") if summary.get("short") else None,
+                    "full": summary.get("full") if summary.get("full") else None
+                }
 
-            # Topics - required
+            # Topics
             if not isinstance(data.get("topics"), list):
                 data["topics"] = []
 
@@ -206,17 +222,52 @@ Ekstrak informasi terstruktur dalam format JSON."""
             logger.error(f"Failed to parse JSON response: {e}")
             logger.debug(f"Response was: {response}")
 
-            # Return minimal structure with title from first ribbon
             title = ""
             if ribbon_texts and len(ribbon_texts) > 0:
                 title = ribbon_texts[0].get("text", "")
             
             return {
                 "title": title,
-                "summary": {"short": "", "full": speech_text[:200]},
+                "actors": None,
+                "summary": {"short": None, "full": None},
                 "topics": [],
                 "raw_llm_response": response,
             }
+
+    def _clean_actors(self, actors) -> Optional[List[Dict]]:
+        """
+        Clean and validate actors data.
+        
+        Returns None if no valid actors found, otherwise returns cleaned list.
+        
+        Args:
+            actors: Raw actors data from LLM response
+            
+        Returns:
+            List of valid actors or None
+        """
+        if not actors or not isinstance(actors, list):
+            return None
+        
+        invalid_names = {"n/a", "na", "tidak ada", "unknown", "-", ""}
+        
+        valid_actors = []
+        for actor in actors:
+            if not isinstance(actor, dict):
+                continue
+            
+            name = actor.get("name", "").strip()
+            if not name or name.lower() in invalid_names:
+                continue
+            
+            valid_actors.append({
+                "name": name,
+                "role": actor.get("role", "").strip() or None,
+                "source": actor.get("source", "ribbon"),
+                "confidence": actor.get("confidence", 0.5)
+            })
+        
+        return valid_actors if valid_actors else None
 
     def normalize_actor_data(self, actors: List[Dict]) -> List[Dict]:
         """
@@ -236,11 +287,9 @@ Ekstrak informasi terstruktur dalam format JSON."""
                 continue
 
             if name in seen:
-                # Merge sources
                 seen[name]["source"] = list(
                     set(seen[name]["source"] + actor.get("source", []))
                 )
-                # Use higher confidence
                 seen[name]["confidence"] = max(
                     seen[name]["confidence"], actor.get("confidence", 0.5)
                 )
