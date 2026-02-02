@@ -97,6 +97,52 @@ class LlamaReasoning:
             logger.error(f"Generation failed: {e}")
             return ""
 
+    def _extract_json_from_response(self, response: str) -> str:
+        """
+        Extract and clean JSON from LLM response.
+        Handles various formats: raw JSON, markdown code blocks, etc.
+        
+        Args:
+            response: Raw LLM response
+            
+        Returns:
+            str: Cleaned JSON string
+        """
+        import re
+        
+        text = response.strip()
+        
+        if "```json" in text:
+            match = re.search(r'```json\s*(.*?)\s*```', text, re.DOTALL)
+            if match:
+                text = match.group(1).strip()
+        elif "```" in text:
+            match = re.search(r'```\s*(.*?)\s*```', text, re.DOTALL)
+            if match:
+                text = match.group(1).strip()
+        
+        start = text.find('{')
+        if start == -1:
+            return text
+            
+        depth = 0
+        end = start
+        for i, char in enumerate(text[start:], start):
+            if char == '{':
+                depth += 1
+            elif char == '}':
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        
+        json_str = text[start:end+1]
+        
+        json_str = re.sub(r',\s*}', '}', json_str)
+        json_str = re.sub(r',\s*]', ']', json_str)
+        
+        return json_str
+
     def extract_news_segment(
         self, speech_text: str, ribbon_texts: List[Dict], channel: str
     ) -> Optional[Dict]:
@@ -111,87 +157,50 @@ class LlamaReasoning:
         Returns:
             dict: Structured news segment data
         """
-        # Build context from ribbon texts
         ribbon_context = "\n".join(
             [f"- [{r['timestamp']}] {r['text']}" for r in ribbon_texts if r.get("text")]
         )
 
-        # System prompt
-        system_prompt = """Anda adalah AI assistant yang bertugas menganalisis berita TV Indonesia dan mengekstrak informasi terstruktur.
+        system_prompt = """Anda adalah AI yang menganalisis berita TV Indonesia. Output HARUS JSON valid.
 
-Tugas Anda:
-1. Ekstrak judul berita dari teks ribbon PERTAMA
-2. Identifikasi aktor/tokoh yang disebutkan (jika ada)
-3. Buat ringkasan berita dari TRANSKRIP AUDIO
-4. Tentukan topik/kategori berita
+FORMAT:
+{"title":"JUDUL","actors":[],"summary":{"short":"1 kalimat","full":"2-3 kalimat"},"topics":["topik"]}
 
-Output HARUS dalam format JSON yang valid:
-{
-  "title": "Judul berita dari ribbon pertama",
-  "actors": [
-    {
-      "name": "Nama lengkap aktor",
-      "role": "Jabatan/peran",
-      "confidence": 0.0-1.0
-    }
-  ],
-  "summary": {
-    "short": "Ringkasan 1 kalimat",
-    "full": "Ringkasan lengkap 2-3 kalimat"
-  },
-  "topics": ["topik1", "topik2"]
-}
+ATURAN:
+- title: salin dari ribbon
+- summary.short: ringkasan 1 kalimat dari transkrip
+- summary.full: ringkasan 2-3 kalimat dari transkrip
+- topics: 2-5 kata kunci"""
 
-ATURAN KETAT:
-1. "title": Salin persis dari ribbon pertama (huruf kapital)
-2. "actors": Isi HANYA jika ada nama orang/tokoh. Jika tidak ada, gunakan array kosong []
-3. "summary": 
-   - Buat HANYA dari informasi di TRANSKRIP AUDIO
-   - JANGAN mengarang atau berasumsi informasi yang tidak ada di transkrip!
-   - JANGAN menyebut "transkrip audio", "dalam audio", atau sumber data apapun
-   - Tulis langsung isi beritanya saja
-   - Jika transkrip kosong/tidak tersedia, ISI DENGAN: {"short": null, "full": null}
-   - short = 1 kalimat inti
-   - full = 2-3 kalimat penjelasan
-4. "topics": Kata kunci dari berita (2-5 topik)
-
-DILARANG KERAS:
-- Mengarang informasi yang tidak ada di transkrip
-- Menyebut "berdasarkan transkrip", "dalam audio", dll di summary
-- Membuat summary jika transkrip kosong (gunakan null)
-
-Gunakan Bahasa Indonesia formal."""
-
-        # User prompt with data
         has_transcript = bool(speech_text and speech_text.strip())
         
-        user_prompt = f"""Analisis segmen berita dari channel {channel}:
+        transcript_text = speech_text[:1500] if has_transcript else ""
+        
+        first_ribbon = ""
+        if ribbon_texts and len(ribbon_texts) > 0:
+            first_ribbon = ribbon_texts[0].get("text", "")
+        
+        user_prompt = f"""Analisis berita:
 
-TRANSKRIP AUDIO:
-{speech_text[:2000] if has_transcript else "[KOSONG - tidak ada transkrip]"}
+JUDUL: {first_ribbon}
 
-TEKS RIBBON:
-{ribbon_context[:1000]}
+TRANSKRIP:
+{transcript_text if has_transcript else "Tidak ada"}
 
-Ekstrak informasi dalam format JSON.
-{"PENTING: Transkrip kosong, jadi summary short dan full HARUS null!" if not has_transcript else "Buat summary dari transkrip, jangan sebut sumber data."}"""
+Buat JSON dengan summary dari transkrip di atas."""
 
-        # Generate
+        logger.info(f"LLM input - has_transcript: {has_transcript}, transcript_len: {len(transcript_text)}")
+        
         response = self.generate(user_prompt, system_prompt)
+        
+        logger.info(f"LLM raw response ({len(response)} chars): {response[:1000]}")
 
-        # Parse JSON
         try:
-            # Extract JSON from response 
-            json_text = response
-            if "```json" in response:
-                json_text = response.split("```json")[1].split("```")[0].strip()
-            elif "```" in response:
-                json_text = response.split("```")[1].split("```")[0].strip()
-
+            json_text = self._extract_json_from_response(response)
             data = json.loads(json_text)
-
-            # Validate and clean structure
             
+            logger.debug(f"Parsed JSON data: {json.dumps(data, ensure_ascii=False)[:500]}...")
+
             # Title 
             if "title" not in data or not data["title"]:
                 if ribbon_texts and len(ribbon_texts) > 0:
@@ -202,17 +211,30 @@ Ekstrak informasi dalam format JSON.
             # Actors
             data["actors"] = self._clean_actors(data.get("actors"))
             
-            # Summary 
             summary = data.get("summary")
             if not isinstance(summary, dict):
+                logger.warning(f"Summary is not a dict: {type(summary)} - {summary}")
                 data["summary"] = {"short": None, "full": None}
             else:
-                data["summary"] = {
-                    "short": summary.get("short") if summary.get("short") else None,
-                    "full": summary.get("full") if summary.get("full") else None
-                }
+                short_val = summary.get("short")
+                full_val = summary.get("full")
+                
+                if isinstance(short_val, str) and short_val.strip():
+                    short_val = short_val.strip()
+                else:
+                    short_val = None
+                    
+                if isinstance(full_val, str) and full_val.strip():
+                    full_val = full_val.strip()
+                else:
+                    full_val = None
+                
+                data["summary"] = {"short": short_val, "full": full_val}
+                
+                if short_val is None and full_val is None and has_transcript:
+                    logger.warning(f"LLM returned empty summary despite having transcript!")
+                    logger.warning(f"Raw LLM response was: {response}")
 
-            # Topics
             if not isinstance(data.get("topics"), list):
                 data["topics"] = []
 
@@ -220,7 +242,8 @@ Ekstrak informasi dalam format JSON.
 
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse JSON response: {e}")
-            logger.debug(f"Response was: {response}")
+            logger.error(f"Full LLM response was:\n{response}")
+            logger.error(f"Extracted JSON text was:\n{json_text}")
 
             title = ""
             if ribbon_texts and len(ribbon_texts) > 0:

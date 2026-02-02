@@ -282,6 +282,78 @@ class StreamCapturer:
 
         logger.info("Browser closed")
 
+    async def start_segment_audio_recording(self, output_path: str) -> bool:
+        """
+        Start continuous audio recording for a segment.
+        
+        This captures audio from the system's audio output (pulseaudio on Linux).
+        Recording continues until explicitly stopped via stop_audio_recording().
+        
+        Args:
+            output_path: Path where to save the audio WAV file
+            
+        Returns:
+            bool: True if recording started successfully
+        """
+        try:
+            await self.stop_audio_recording()
+            
+            output_path = Path(output_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            audio_config = self.config.get("audio", {})
+            sample_rate = audio_config.get("sample_rate", 16000)
+            
+            try:
+                result = subprocess.run(
+                    ["pactl", "get-default-sink"],
+                    capture_output=True,
+                    text=True,
+                    timeout=2
+                )
+                if result.returncode == 0:
+                    default_sink = result.stdout.strip()
+                    audio_source = f"{default_sink}.monitor"
+                    logger.debug(f"Using PulseAudio monitor: {audio_source}")
+                else:
+                    audio_source = "default"
+                    logger.debug("Using default PulseAudio source")
+            except:
+                audio_source = "default"
+                logger.debug("Failed to detect sink, using default source")
+            
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-f", "pulse",
+                "-i", audio_source,
+                "-ar", str(sample_rate),
+                "-ac", "1",
+                "-acodec", "pcm_s16le",
+                str(output_path)
+            ]
+            
+            logger.info(f"Starting segment audio recording: {output_path.name}")
+            
+            self.audio_recording_process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL
+            )
+            
+            self.current_audio_output = output_path
+            
+            logger.debug(f"Segment audio recording started (PID: {self.audio_recording_process.pid})")
+            return True
+            
+        except FileNotFoundError:
+            logger.error("FFmpeg not found. Please install: sudo apt-get install ffmpeg")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to start segment audio recording: {e}")
+            return False
+
     async def start_audio_recording(self, output_path: str, duration: int = 30) -> bool:
         """
         Start recording audio from the browser tab using FFmpeg.
@@ -297,17 +369,15 @@ class StreamCapturer:
             bool: True if recording started successfully
         """
         try:
-            # Stop any existing recording first
             await self.stop_audio_recording()
             
             output_path = Path(output_path)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             
-            # Get audio configuration
             audio_config = self.config.get("audio", {})
             sample_rate = audio_config.get("sample_rate", 16000)
             
-            # Try to get the default sink's monitor
+
             try:
                 result = subprocess.run(
                     ["pactl", "get-default-sink"],

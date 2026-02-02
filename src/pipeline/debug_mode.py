@@ -60,13 +60,10 @@ class DebugOrchestrator:
             "ribbon_changes": 0,
             "ribbon_disappeared": 0,
             "ocr_extractions": 0,
-            "audio_chunks": 0,
-            "audio_success": 0,
-            "audio_failed": 0,
-            "transcription_success": 0,
-            "transcription_failed": 0,
             "segments_completed": 0,
             "segments_discarded": 0,
+            "segments_audio_recorded": 0,
+            "segments_transcribed": 0,
             "total_confidence": 0.0,
             "total_audio_duration": 0.0,
         }
@@ -78,12 +75,11 @@ class DebugOrchestrator:
         self.save_audio = debug_config.get("save_audio", True)
         
         self.vision_history = []
-        self.audio_history = []
         self.last_vision_result = None
         
         self.vision_queue = asyncio.Queue()
         self.processing_tasks = []
-        self.audio_task = None  
+        self.current_segment_audio_path = None
 
         logger.info("Debug mode initialized successfully")
 
@@ -136,7 +132,6 @@ class DebugOrchestrator:
 
         keep_alive_task = asyncio.create_task(self.browser.keep_alive())
         monitor_task = asyncio.create_task(self._display_monitor())
-        worker_tasks = []
 
         try:
             await self._debug_loop(channel_name)
@@ -148,15 +143,10 @@ class DebugOrchestrator:
             self.is_running = False
             keep_alive_task.cancel()
             monitor_task.cancel()
-            for task in worker_tasks:
-                task.cancel()
             
-            if self.audio_task and not self.audio_task.done():
-                self.audio_task.cancel()
-                
+            await self._stop_segment_audio_recording()
             await self.browser.close()
             
-            # Save final report
             self._save_session_report()
 
         logger.info("Debug session stopped")
@@ -169,22 +159,18 @@ class DebugOrchestrator:
             channel: Channel name
         """
         video_config = self.config.get("video", {})
-        audio_config = self.config.get("audio", {})
 
-        frame_interval = 1.0 / video_config.get("fps_sample_rate", 0.5)  # seconds
-        audio_interval = audio_config.get("chunk_duration", 30)  # seconds
+        frame_interval = 1.0 / video_config.get("fps_sample_rate", 0.5)
 
         last_frame_time = 0
-        last_audio_time = 0
 
         logger.info("Starting continuous capture loop...")
         logger.info(f"Frame capture: every {frame_interval:.1f}s")
-        logger.info(f"Audio capture: every {audio_interval}s")
+        logger.info("Audio recording: segment-based (starts with segment, stops when segment ends)")
 
         while self.is_running:
             current_time = time.time()
 
-            # Capture video frame 
             if current_time - last_frame_time >= frame_interval:
                 logger.debug(f"[LOOP] Capturing frame at {current_time:.2f}")
                 
@@ -193,14 +179,6 @@ class DebugOrchestrator:
                 logger.debug(f"[LOOP] Frame capture completed")
                 last_frame_time = current_time
 
-            # Process audio 
-            if current_time - last_audio_time >= audio_interval:
-                if self.audio_task is None or self.audio_task.done():
-                    logger.debug(f"[LOOP] Starting audio task")
-                    self.audio_task = asyncio.create_task(self._capture_and_process_audio())
-                last_audio_time = current_time
-
-            # Small delay
             await asyncio.sleep(0.1)
 
     async def _capture_and_process_frame(self):
@@ -210,7 +188,6 @@ class DebugOrchestrator:
         try:
             logger.debug(f"[CAPTURE] Starting frame capture")
             
-            # Capture frame 
             frame_data = await self.browser.capture_frame()
             self.stats["frames_captured"] += 1
             
@@ -299,7 +276,7 @@ class DebugOrchestrator:
 
     async def _handle_segment_event(self, event: Dict, frame_number: int):
         """
-        Handle segment detection events.
+        Handle segment detection events and manage segment audio recording.
         
         Args:
             event: Segment event dict from SegmentDetector
@@ -311,12 +288,17 @@ class DebugOrchestrator:
             segment = event.get("segment")
             logger.info(f"[SEGMENT START] {segment.segment_id} at frame {frame_number}")
             
+            await self._start_segment_audio_recording(segment)
+            
         elif action == "end_segment":
             segment = event.get("segment")
             logger.info(f"[SEGMENT END] {segment.segment_id} at frame {frame_number} "
                        f"(duration={segment.duration_sec}s, ribbons={len(segment.ribbon_texts)})")
             
-            # Process segment with LLM in background
+            audio_file = await self._stop_segment_audio_recording()
+            if audio_file:
+                segment.audio_file_path = str(audio_file)
+            
             asyncio.create_task(self._finalize_segment(segment))
             
         elif action == "discard":
@@ -325,31 +307,170 @@ class DebugOrchestrator:
             logger.info(f"[SEGMENT DISCARD] {segment.segment_id} - {reason}")
             self.stats["segments_discarded"] += 1
             
+            await self._discard_segment_audio_recording()
+            
         elif action == "ready":
             logger.info(f"[SEGMENT] Ready for new segments (cold start complete)")
             
         elif action == "skip":
             logger.debug(f"[SEGMENT] Skipping - {event.get('reason', 'cold_start')}")
 
+    async def _start_segment_audio_recording(self, segment: SegmentData):
+        """
+        Start audio recording for a new segment.
+        
+        Args:
+            segment: The segment that just started
+        """
+        if not self.save_audio:
+            return
+        
+        try:
+            audio_filename = f"{segment.segment_id}.wav"
+            audio_path = self.session_dir / "audio" / audio_filename
+            
+            recording_started = await self.browser.start_segment_audio_recording(str(audio_path))
+            
+            if recording_started:
+                self.current_segment_audio_path = audio_path
+                logger.info(f"[AUDIO] Started recording for segment {segment.segment_id}")
+            else:
+                logger.error(f"[AUDIO] Failed to start recording for segment {segment.segment_id}")
+                self.current_segment_audio_path = None
+                
+        except Exception as e:
+            logger.error(f"[AUDIO] Error starting segment recording: {e}")
+            self.current_segment_audio_path = None
+
+    async def _stop_segment_audio_recording(self) -> Optional[Path]:
+        """
+        Stop the current segment audio recording.
+        
+        Returns:
+            Path to the recorded audio file, or None if no recording was active
+        """
+        if self.current_segment_audio_path is None:
+            return None
+        
+        try:
+            audio_file = await self.browser.stop_audio_recording()
+            
+            if audio_file and audio_file.exists():
+                file_size = audio_file.stat().st_size
+                if file_size > 1000:
+                    self.stats["segments_audio_recorded"] += 1
+                    logger.info(f"[AUDIO] Recording stopped: {audio_file.name} ({file_size:,} bytes)")
+                    self.current_segment_audio_path = None
+                    return audio_file
+                else:
+                    logger.warning(f"[AUDIO] Recording too small ({file_size} bytes), discarding")
+                    audio_file.unlink(missing_ok=True)
+            
+            self.current_segment_audio_path = None
+            return None
+            
+        except Exception as e:
+            logger.error(f"[AUDIO] Error stopping segment recording: {e}")
+            self.current_segment_audio_path = None
+            return None
+
+    async def _discard_segment_audio_recording(self):
+        """
+        Discard the current segment audio recording without saving.
+        """
+        if self.current_segment_audio_path is None:
+            return
+        
+        try:
+            await self.browser.stop_audio_recording()
+            
+            if self.current_segment_audio_path.exists():
+                self.current_segment_audio_path.unlink(missing_ok=True)
+                logger.info(f"[AUDIO] Discarded recording: {self.current_segment_audio_path.name}")
+            
+            self.current_segment_audio_path = None
+            
+        except Exception as e:
+            logger.error(f"[AUDIO] Error discarding segment recording: {e}")
+            self.current_segment_audio_path = None
+
+    async def _transcribe_segment_audio(self, segment: SegmentData) -> str:
+        """
+        Transcribe the audio file for a segment.
+        
+        Args:
+            segment: Segment data with audio_file_path set
+            
+        Returns:
+            Transcribed text, or empty string if transcription failed
+        """
+        try:
+            audio_path = Path(segment.audio_file_path)
+            
+            if not audio_path.exists():
+                logger.warning(f"[TRANSCRIPTION] Audio file not found: {audio_path}")
+                return ""
+            
+            file_size = audio_path.stat().st_size
+            logger.info(f"[TRANSCRIPTION] Starting transcription for {segment.segment_id} ({file_size:,} bytes)")
+            
+            loop = asyncio.get_event_loop()
+            transcription_result = await loop.run_in_executor(
+                None,
+                self.whisper.transcribe_audio_file,
+                str(audio_path)
+            )
+            
+            if transcription_result and transcription_result.get("text"):
+                text = transcription_result["text"].strip()
+                
+                transcript_data = {
+                    "segment_id": segment.segment_id,
+                    "audio_file": audio_path.name,
+                    "text": text,
+                    "language": transcription_result.get("language", "id"),
+                    "duration_sec": segment.duration_sec,
+                    "timestamp": transcription_result.get("timestamp"),
+                    "file_size_bytes": file_size
+                }
+                
+                transcript_path = self.session_dir / "transcripts" / f"{segment.segment_id}.json"
+                transcript_path.write_text(json.dumps(transcript_data, indent=2, ensure_ascii=False))
+                
+                segment.audio_chunks.append(transcript_data)
+                
+                self.stats["segments_transcribed"] += 1
+                self.stats["total_audio_duration"] += segment.duration_sec
+                
+                text_preview = text[:100] if len(text) > 100 else text
+                logger.info(f"[TRANSCRIPTION] {segment.segment_id} SUCCESS: {text_preview}...")
+                
+                return text
+            else:
+                logger.warning(f"[TRANSCRIPTION] {segment.segment_id} returned empty result")
+                return ""
+                
+        except Exception as e:
+            logger.error(f"[TRANSCRIPTION] {segment.segment_id} FAILED: {e}")
+            return ""
+
     async def _finalize_segment(self, segment: SegmentData):
         """
-        Finalize segment: run LLM processing and save JSON output.
+        Finalize segment: transcribe audio, run LLM processing, and save JSON output.
         
         Args:
             segment: Completed segment data
         """
         try:
-            logger.info(f"Processing segment {segment.segment_id} with LLM...")
+            logger.info(f"Processing segment {segment.segment_id}...")
             
-            # Combine audio transcriptions
-            speech_text = " ".join(
-                [chunk.get("text", "") for chunk in segment.audio_chunks]
-            ).strip()
+            speech_text = ""
             
-            if not speech_text:
-                speech_text = ""
+            if segment.audio_file_path and Path(segment.audio_file_path).exists():
+                speech_text = await self._transcribe_segment_audio(segment)
             
-            # Run LLM extraction
+            logger.info(f"Running LLM extraction for segment {segment.segment_id}...")
+            
             loop = asyncio.get_event_loop()
             content_data = await loop.run_in_executor(
                 None,
@@ -359,10 +480,8 @@ class DebugOrchestrator:
                 segment.channel
             )
             
-            # Build output JSON
-            output = self._build_output_json(segment, content_data)
+            output = self._build_output_json(segment, content_data, speech_text)
             
-            # Save segment
             self._save_segment(output)
             
             self.stats["segments_completed"] += 1
@@ -371,13 +490,14 @@ class DebugOrchestrator:
         except Exception as e:
             logger.error(f"Failed to finalize segment {segment.segment_id}: {e}", exc_info=True)
 
-    def _build_output_json(self, segment: SegmentData, content_data: Dict) -> Dict:
+    def _build_output_json(self, segment: SegmentData, content_data: Dict, speech_text: str = "") -> Dict:
         """
         Build final JSON output structure.
         
         Args:
             segment: Segment data
             content_data: LLM extracted content
+            speech_text: Transcribed speech text
             
         Returns:
             dict: Final output structure
@@ -392,14 +512,12 @@ class DebugOrchestrator:
             },
             "content": {
                 "title": content_data.get("title", ""),
-                "actors": content_data.get("actors"),  # Will be None if no valid actors
-                "summary": content_data.get("summary", {"short": "", "full": ""}),
+                "actors": content_data.get("actors"),
+                "summary": content_data.get("summary", {"short": None, "full": None}),
                 "topics": content_data.get("topics", []),
             },
             "raw": {
-                "speech_text": " ".join(
-                    [chunk.get("text", "") for chunk in segment.audio_chunks]
-                ),
+                "speech_text": speech_text,
                 "ribbon_texts": segment.ribbon_texts,
             },
         }
@@ -424,101 +542,6 @@ class DebugOrchestrator:
         except Exception as e:
             logger.error(f"Failed to save segment: {e}")
     
-    async def _capture_and_process_audio(self):
-        """
-        Capture and process audio chunk from livestream.
-        
-        Records audio for the configured duration, then transcribes it using Whisper.
-        Saves both the audio file and transcription result.
-        """
-        try:
-            audio_config = self.config.get("audio", {})
-            chunk_duration = audio_config.get("chunk_duration", 30)
-            
-            self.stats["audio_chunks"] += 1
-            chunk_number = self.stats["audio_chunks"]
-            
-            # Prepare output paths
-            audio_filename = f"audio_{chunk_number:06d}.wav"
-            audio_path = self.session_dir / "audio" / audio_filename
-            
-            transcript_filename = f"transcript_{chunk_number:06d}.json"
-            transcript_path = self.session_dir / "transcripts" / transcript_filename
-            
-            logger.info(f"[AUDIO] Starting audio capture #{chunk_number} ({chunk_duration}s)...")
-            
-            # Start audio recording
-            recording_started = await self.browser.start_audio_recording(
-                str(audio_path),
-                duration=chunk_duration
-            )
-            
-            if not recording_started:
-                logger.error(f"[AUDIO] Failed to start recording #{chunk_number}")
-                self.stats["audio_failed"] += 1
-                return
-            
-            logger.debug(f"[AUDIO] Recording in progress... ({chunk_duration}s)")
-            recorded_file = await self.browser.wait_for_audio_recording()
-            
-            if recorded_file is None or not recorded_file.exists():
-                logger.error(f"[AUDIO] Recording #{chunk_number} failed - no output file")
-                self.stats["audio_failed"] += 1
-                return
-            
-            file_size = recorded_file.stat().st_size
-            if file_size < 1000:  
-                logger.warning(f"[AUDIO] Recording #{chunk_number} too small ({file_size} bytes)")
-                self.stats["audio_failed"] += 1
-                return
-            
-            logger.info(f"[AUDIO] Recording #{chunk_number} completed: {file_size:,} bytes")
-            self.stats["audio_success"] += 1
-            self.stats["total_audio_duration"] += chunk_duration
-            
-            if self.save_audio:
-                logger.info(f"[AUDIO] Transcribing audio #{chunk_number}...")
-                
-                try:
-                    loop = asyncio.get_event_loop()
-                    transcription_result = await loop.run_in_executor(
-                        None,
-                        self.whisper.transcribe_audio_file,
-                        str(recorded_file)
-                    )
-                    
-                    if transcription_result and transcription_result.get("text"):
-                        transcript_data = {
-                            "chunk_number": chunk_number,
-                            "audio_file": audio_filename,
-                            "text": transcription_result["text"],
-                            "language": transcription_result.get("language", "id"),
-                            "duration": chunk_duration,
-                            "timestamp": transcription_result.get("timestamp"),
-                            "file_size_bytes": file_size
-                        }
-                        
-                        transcript_path.write_text(json.dumps(transcript_data, indent=2, ensure_ascii=False))
-                        
-                        # Add to current segment if recording
-                        self.segment_detector.add_audio_chunk(transcript_data)
-                        
-                        text_preview = transcription_result["text"][:100]
-                        logger.info(f"[TRANSCRIPTION] #{chunk_number} SUCCESS: {text_preview}...")
-                        self.stats["transcription_success"] += 1
-                        
-                    else:
-                        logger.warning(f"[TRANSCRIPTION] #{chunk_number} returned empty result")
-                        self.stats["transcription_failed"] += 1
-                        
-                except Exception as e:
-                    logger.error(f"[TRANSCRIPTION] #{chunk_number} FAILED: {e}")
-                    self.stats["transcription_failed"] += 1
-            
-        except Exception as e:
-            logger.error(f"[AUDIO] Error in audio processing: {e}", exc_info=True)
-            self.stats["audio_failed"] += 1
-
     async def _display_monitor(self):
         """Display real-time monitoring dashboard"""
         while self.is_running:
@@ -534,19 +557,15 @@ class DebugOrchestrator:
                 if self.stats["ocr_extractions"] > 0 else 0
             )
             
-            audio_success_rate = (
-                self.stats["audio_success"] / self.stats["audio_chunks"] * 100
-                if self.stats["audio_chunks"] > 0 else 0
+            transcription_rate = (
+                self.stats["segments_transcribed"] / self.stats["segments_audio_recorded"] * 100
+                if self.stats["segments_audio_recorded"] > 0 else 0
             )
             
-            transcription_success_rate = (
-                self.stats["transcription_success"] / self.stats["audio_success"] * 100
-                if self.stats["audio_success"] > 0 else 0
-            )
-            
-            # Get segment info
             segment_state = self.segment_detector.get_state()
             segment_progress = self.segment_detector.get_segment_progress()
+            
+            is_recording_audio = self.current_segment_audio_path is not None
             
             print("\n" + "=" * 80)
             print("  LIVESTREAM INTELLIGENCE - DEBUG MODE")
@@ -559,7 +578,7 @@ class DebugOrchestrator:
                 print(f"   Current Segment: {segment_progress['segment_id']}")
                 print(f"   Duration: {segment_progress['duration']}s")
                 print(f"   Ribbons: {segment_progress['ribbon_count']}")
-                print(f"   Audio Chunks: {segment_progress['audio_chunks']}")
+                print(f"   Audio Recording: {'ACTIVE' if is_recording_audio else 'INACTIVE'}")
             print(f"   Segments Completed: {self.stats['segments_completed']}")
             print(f"   Segments Discarded: {self.stats['segments_discarded']}")
             print()
@@ -574,12 +593,9 @@ class DebugOrchestrator:
             print(f"   Total Frames: {self.stats['frames_captured']}")
             print(f"   FPS (actual): {fps_actual:.2f}")
             print()
-            print("AUDIO CAPTURE & TRANSCRIPTION (Whisper)")
-            print(f"   Audio Chunks: {self.stats['audio_chunks']}")
-            print(f"   Recording Success: {self.stats['audio_success']} ({audio_success_rate:.1f}%)")
-            print(f"   Recording Failed: {self.stats['audio_failed']}")
-            print(f"   Transcription Success: {self.stats['transcription_success']} ({transcription_success_rate:.1f}%)")
-            print(f"   Transcription Failed: {self.stats['transcription_failed']}")
+            print("SEGMENT AUDIO (Whisper)")
+            print(f"   Segments Recorded: {self.stats['segments_audio_recorded']}")
+            print(f"   Segments Transcribed: {self.stats['segments_transcribed']} ({transcription_rate:.1f}%)")
             print(f"   Total Audio Duration: {self._format_duration(self.stats['total_audio_duration'])}")
             print()
             print("OUTPUT")
@@ -608,14 +624,9 @@ class DebugOrchestrator:
                 if self.stats["ocr_extractions"] > 0 else 0
             )
             
-            audio_success_rate = (
-                self.stats["audio_success"] / self.stats["audio_chunks"] * 100
-                if self.stats["audio_chunks"] > 0 else 0
-            )
-            
-            transcription_success_rate = (
-                self.stats["transcription_success"] / self.stats["audio_success"] * 100
-                if self.stats["audio_success"] > 0 else 0
+            transcription_rate = (
+                self.stats["segments_transcribed"] / self.stats["segments_audio_recorded"] * 100
+                if self.stats["segments_audio_recorded"] > 0 else 0
             )
             
             report = {
@@ -633,8 +644,8 @@ class DebugOrchestrator:
                         if self.stats["ribbon_detections"] > 0 else 0
                     ),
                     "avg_ribbon_confidence": avg_confidence,
-                    "audio_capture_success_rate": audio_success_rate,
-                    "transcription_success_rate": transcription_success_rate,
+                    "segments_audio_recorded": self.stats["segments_audio_recorded"],
+                    "transcription_rate": transcription_rate,
                     "total_audio_duration_sec": self.stats["total_audio_duration"],
                 },
                 "segment_detection": {
@@ -644,8 +655,8 @@ class DebugOrchestrator:
                 },
                 "output_files": {
                     "ribbons": len(list((self.session_dir / "ocr").glob("ribbon_*.json"))),
-                    "audio_files": len(list((self.session_dir / "audio").glob("audio_*.wav"))),
-                    "transcripts": len(list((self.session_dir / "transcripts").glob("transcript_*.json"))),
+                    "audio_files": len(list((self.session_dir / "audio").glob("*.wav"))),
+                    "transcripts": len(list((self.session_dir / "transcripts").glob("*.json"))),
                     "segments": len(list(self.segments_dir.glob("*.json"))),
                 },
                 "output_directory": str(self.session_dir),
@@ -672,10 +683,9 @@ class DebugOrchestrator:
             print(f"  OCR Extractions: {self.stats['ocr_extractions']}")
             print(f"  Avg Confidence: {avg_confidence:.2f}")
             print()
-            print("AUDIO:")
-            print(f"  Audio Chunks: {self.stats['audio_chunks']}")
-            print(f"  Recording Success: {self.stats['audio_success']} ({audio_success_rate:.1f}%)")
-            print(f"  Transcription Success: {self.stats['transcription_success']} ({transcription_success_rate:.1f}%)")
+            print("SEGMENT AUDIO:")
+            print(f"  Segments Recorded: {self.stats['segments_audio_recorded']}")
+            print(f"  Segments Transcribed: {self.stats['segments_transcribed']} ({transcription_rate:.1f}%)")
             print(f"  Total Audio Duration: {self._format_duration(self.stats['total_audio_duration'])}")
             print()
             print("OUTPUT:")
@@ -686,3 +696,4 @@ class DebugOrchestrator:
             
         except Exception as e:
             logger.error(f"Failed to save session report: {e}")
+

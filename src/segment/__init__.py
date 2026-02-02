@@ -33,6 +33,7 @@ class SegmentData:
     duration_sec: int = 0
     ribbon_texts: List[Dict] = field(default_factory=list)
     audio_chunks: List[Dict] = field(default_factory=list)
+    audio_file_path: Optional[str] = None
     status: str = "active"
 
 
