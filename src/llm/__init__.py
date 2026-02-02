@@ -161,16 +161,50 @@ class LlamaReasoning:
             [f"- [{r['timestamp']}] {r['text']}" for r in ribbon_texts if r.get("text")]
         )
 
-        system_prompt = """Anda adalah AI yang menganalisis berita TV Indonesia. Output HARUS JSON valid.
+        system_prompt = """Anda adalah AI assistant yang bertugas menganalisis berita TV Indonesia dan mengekstrak informasi terstruktur.
 
-FORMAT:
-{"title":"JUDUL","actors":[],"summary":{"short":"1 kalimat","full":"2-3 kalimat"},"topics":["topik"]}
+Tugas Anda:
+1. Ekstrak judul berita dari teks ribbon PERTAMA
+2. Identifikasi aktor/tokoh yang disebutkan (jika ada)
+3. Buat ringkasan berita dari TRANSKRIP AUDIO
+4. Tentukan topik/kategori berita
 
-ATURAN:
-- title: salin dari ribbon
-- summary.short: ringkasan 1 kalimat dari transkrip
-- summary.full: ringkasan 2-3 kalimat dari transkrip
-- topics: 2-5 kata kunci"""
+Output HARUS dalam format JSON yang valid:
+{
+  "title": "Judul berita dari ribbon pertama",
+  "actors": [
+    {
+      "name": "Nama lengkap aktor",
+      "role": "Jabatan/peran",
+      "confidence": 0.0-1.0
+    }
+  ],
+  "summary": {
+    "short": "Ringkasan 1 kalimat",
+    "full": "Ringkasan lengkap 2-3 kalimat"
+  },
+  "topics": ["topik1", "topik2"]
+}
+
+ATURAN KETAT:
+1. "title": Salin persis dari ribbon pertama (huruf kapital)
+2. "actors": Isi HANYA jika ada nama orang/tokoh. Jika tidak ada, gunakan array kosong []
+3. "summary": 
+   - Buat HANYA dari informasi di TRANSKRIP AUDIO
+   - JANGAN mengarang atau berasumsi informasi yang tidak ada di transkrip!
+   - JANGAN menyebut "transkrip audio", "dalam audio", atau sumber data apapun
+   - Tulis langsung isi beritanya saja
+   - Jika transkrip kosong/tidak tersedia, ISI DENGAN: {"short": null, "full": null}
+   - short = 1 kalimat inti
+   - full = 2-3 kalimat penjelasan
+4. "topics": Kata kunci dari berita (2-5 topik)
+
+DILARANG KERAS:
+- Mengarang informasi yang tidak ada di transkrip
+- Menyebut "berdasarkan transkrip", "dalam audio", dll di summary
+- Membuat summary jika transkrip kosong (gunakan null)
+
+Gunakan Bahasa Indonesia formal."""
 
         has_transcript = bool(speech_text and speech_text.strip())
         
