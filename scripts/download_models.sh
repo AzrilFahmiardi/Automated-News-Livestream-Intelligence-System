@@ -65,6 +65,17 @@ download_model \
     "$MODELS_DIR/qwen2.5-1.5b-instruct-q4_k_m.gguf" \
     "Qwen2.5-1.5B-Instruct Q4_K_M (1GB)"
 
+# Pre-download EasyOCR models
+echo ""
+echo "=== EasyOCR Models ==="
+echo -e "${YELLOW}Pre-downloading EasyOCR models for Indonesian and English...${NC}"
+python3 -c "
+import easyocr
+print('Initializing EasyOCR reader to trigger model download...')
+reader = easyocr.Reader(['id', 'en'], gpu=False, verbose=True)
+print('EasyOCR models downloaded successfully')
+" 2>/dev/null || echo -e "${RED}Python/EasyOCR not available, skipping EasyOCR pre-download${NC}"
+
 # Check total size
 echo ""
 echo "=== Summary ==="

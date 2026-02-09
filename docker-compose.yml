@@ -1,0 +1,58 @@
+services:
+  news-intel:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: news-intel-system
+    
+    # Restart policy for production
+    restart: unless-stopped
+    
+    # Shared memory size
+    shm_size: 2gb
+    
+    # Environment variables
+    environment:
+      - DISPLAY=:99
+      - TZ=Asia/Jakarta
+    
+    # Volume mounts
+    volumes:
+      # Persist output data (segments, logs, debug)
+      - ./output:/app/output
+      
+      # Mount config for runtime modifications 
+      - ./config/settings.yaml:/app/config/settings.yaml:ro
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 6G
+        reservations:
+          memory: 4G
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "python main.py"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+
+  # Debug mode service
+  news-intel-debug:
+    extends:
+      service: news-intel
+    container_name: news-intel-debug
+    command: ["python", "main.py", "--debug"]
+    profiles:
+      - debug
+    restart: "no"

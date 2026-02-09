@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.eggs/
+*.egg-info/
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# Browser data (contains session cookies, should not be in image)
+browser_data/
+
+# YOLO training runs (not needed for production)
+runs/
+
+# Models (downloaded during docker build, not copied from local)
+models/
+
+# Debug outputs (will be mounted as volume)
+output/debug/
+output/segments/
+output/logs/
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Documentation (optional, reduce image size)
+*.md
+!README.md
+
+# Test files
+tests/
+pytest.ini
+.pytest_cache/
+
+# Development configs
+.env
+.env.local
+*.local.yaml

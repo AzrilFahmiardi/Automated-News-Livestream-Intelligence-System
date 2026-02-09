@@ -34,7 +34,6 @@ class StreamCapturer:
         # Start patchright
         self.playwright = await async_playwright().start()
 
-        # Browser launch options with additional stealth
         browser_config = self.config.get("browser", {})
         
         self.browser_instance = await self.playwright.chromium.launch(
@@ -46,16 +45,16 @@ class StreamCapturer:
                 "--disable-dev-shm-usage",
                 "--disable-web-security",
                 "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                # Audio settings for Docker/headless
+                "--autoplay-policy=no-user-gesture-required",  # Allow autoplay with audio
+                "--use-fake-ui-for-media-stream",  # Allow media without prompts
             ],
         )
         
-        # Create page directly
         self.page = await self.browser_instance.new_page()
 
-        # Set realistic viewport
         await self.page.set_viewport_size({"width": 1920, "height": 1080})
 
-        # Allow browser network stack to initialize
         await asyncio.sleep(1)
 
         logger.info("Browser initialized successfully")
@@ -73,11 +72,9 @@ class StreamCapturer:
         try:
             logger.info(f"Opening livestream: {url}")
 
-            # Navigate to URL
             logger.info("Navigating to URL...")
             await self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
             
-            # Inject stealth scripts AFTER page load (avoids DNS issues)
             logger.info("Injecting stealth scripts...")
             await self.page.evaluate("""
                 () => {
@@ -106,10 +103,8 @@ class StreamCapturer:
             logger.info("Page loaded, dismissing popups...")
             await self._dismiss_popups()
             
-            # Allow page to settle
             await asyncio.sleep(2)
             
-            # Click play button if present
             logger.info("Looking for play button...")
             try:
                 play_selectors = [
@@ -128,7 +123,6 @@ class StreamCapturer:
                 logger.warning(f"Could not click play button: {e}")
             
             logger.info("Waiting for video element...")
-            # Force show video element with JavaScript
             try:
                 await self.page.evaluate("""
                     () => {
@@ -145,12 +139,10 @@ class StreamCapturer:
             except Exception as e:
                 logger.warning(f"Could not execute video show script: {e}")
             
-            # Wait for video element to be attached to DOM
             await self.page.wait_for_selector("video", state="attached", timeout=30000)
             
             logger.info("Video element ready")
 
-            # Allow video to start loading
             await asyncio.sleep(2)
 
             logger.info("Livestream opened successfully")
@@ -192,13 +184,11 @@ class StreamCapturer:
     async def _dismiss_popups(self):
         """Dismiss YouTube popups and cookie banners"""
         try:
-            # Dismiss cookie consent
             cookie_button = await self.page.query_selector('button[aria-label*="Accept"]')
             if cookie_button:
                 await cookie_button.click()
                 await asyncio.sleep(0.5)
 
-            # Dismiss any other dialogs
             dismiss_button = await self.page.query_selector('button[aria-label*="Dismiss"]')
             if dismiss_button:
                 await dismiss_button.click()
@@ -214,13 +204,11 @@ class StreamCapturer:
             bytes: PNG image data or None if failed
         """
         try:
-            # Get video element
             video = await self.page.query_selector("video")
             if not video:
                 logger.warning("Video element not found")
                 return None
 
-            # Take screenshot of video element
             screenshot = await video.screenshot(type="png")
             return screenshot
 
@@ -244,13 +232,11 @@ class StreamCapturer:
 
         while self.is_running:
             try:
-                # More natural random mouse movement
                 x = random.randint(200, 1700)
                 y = random.randint(200, 900)
                 await self.page.mouse.move(x, y)
 
-                # move mouse over video 
-                if random.random() < 0.3:  # 30% chance
+                if random.random() < 0.3:  
                     video = await self.page.query_selector("video")
                     if video:
                         box = await video.bounding_box()
@@ -259,7 +245,6 @@ class StreamCapturer:
                             vy = box['y'] + random.randint(50, int(box['height']) - 50)
                             await self.page.mouse.move(vx, vy)
 
-                # Vary interval slightly
                 await asyncio.sleep(mouse_interval + random.uniform(-5, 5))
 
             except Exception as e:
@@ -271,7 +256,6 @@ class StreamCapturer:
         logger.info("Closing browser...")
         self.is_running = False
         
-        # Stop any ongoing audio recording
         await self.stop_audio_recording()
             
         if self.browser_instance:
@@ -304,6 +288,7 @@ class StreamCapturer:
             audio_config = self.config.get("audio", {})
             sample_rate = audio_config.get("sample_rate", 16000)
             
+            audio_source = None
             try:
                 result = subprocess.run(
                     ["pactl", "get-default-sink"],
@@ -311,16 +296,17 @@ class StreamCapturer:
                     text=True,
                     timeout=2
                 )
-                if result.returncode == 0:
+                if result.returncode == 0 and result.stdout.strip():
                     default_sink = result.stdout.strip()
-                    audio_source = f"{default_sink}.monitor"
-                    logger.debug(f"Using PulseAudio monitor: {audio_source}")
-                else:
-                    audio_source = "default"
-                    logger.debug("Using default PulseAudio source")
-            except:
-                audio_source = "default"
-                logger.debug("Failed to detect sink, using default source")
+                    if default_sink != "unknown" and default_sink:
+                        audio_source = f"{default_sink}.monitor"
+                        logger.info(f"Using PulseAudio monitor: {audio_source}")
+            except Exception as e:
+                logger.warning(f"Failed to detect PulseAudio sink: {e}")
+            
+            if not audio_source:
+                audio_source = "virtual_speaker.monitor"
+                logger.info(f"Using fallback audio source: {audio_source}")
             
             cmd = [
                 "ffmpeg",
@@ -334,6 +320,7 @@ class StreamCapturer:
             ]
             
             logger.info(f"Starting segment audio recording: {output_path.name}")
+            logger.debug(f"FFmpeg command: {' '.join(cmd)}")
             
             self.audio_recording_process = subprocess.Popen(
                 cmd,
@@ -344,7 +331,15 @@ class StreamCapturer:
             
             self.current_audio_output = output_path
             
-            logger.debug(f"Segment audio recording started (PID: {self.audio_recording_process.pid})")
+            await asyncio.sleep(0.5)
+            if self.audio_recording_process.poll() is not None:
+                stderr = self.audio_recording_process.stderr.read().decode() if self.audio_recording_process.stderr else ""
+                logger.error(f"FFmpeg audio recording failed to start: {stderr[:500]}")
+                self.audio_recording_process = None
+                self.current_audio_output = None
+                return False
+            
+            logger.info(f"Segment audio recording started (PID: {self.audio_recording_process.pid})")
             return True
             
         except FileNotFoundError:
@@ -410,7 +405,6 @@ class StreamCapturer:
             
             logger.info(f"Starting audio recording: {output_path.name} ({duration}s)")
             
-            # Start FFmpeg process in background
             self.audio_recording_process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -441,7 +435,6 @@ class StreamCapturer:
             return None
         
         try:
-            # Check if process is still running
             if self.audio_recording_process.poll() is None:
                 self.audio_recording_process.terminate()
                 
@@ -454,11 +447,9 @@ class StreamCapturer:
             
             output_path = self.current_audio_output
             
-            # Clean up
             self.audio_recording_process = None
             self.current_audio_output = None
             
-            # Verify file was created
             if output_path and output_path.exists():
                 file_size = output_path.stat().st_size
                 logger.info(f"Audio recording saved: {output_path.name} ({file_size} bytes)")
@@ -497,11 +488,9 @@ class StreamCapturer:
             
             output_path = self.current_audio_output
             
-            # Clean up
             self.audio_recording_process = None
             self.current_audio_output = None
             
-            # Verify file
             if output_path and output_path.exists():
                 return output_path
             else:
